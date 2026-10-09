@@ -1,0 +1,230 @@
+syntax = "proto3";
+
+package mca.ai.v1;
+
+// ── Shared enums ────────────────────────────────────────────────────────
+
+enum Speaker {
+  SPEAKER_UNSPECIFIED = 0;
+  SPEAKER_AGENT = 1;
+  SPEAKER_CUSTOMER = 2;
+}
+
+enum Qualification {
+  QUALIFICATION_UNSPECIFIED = 0;
+  QUALIFICATION_PENDING = 1;
+  QUALIFICATION_QUALIFIED = 2;
+  QUALIFICATION_REJECTED = 3;
+  QUALIFICATION_NEEDS_HUMAN = 4;
+}
+
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_ACTIVE = 1;
+  SESSION_STATUS_FINISHED = 2;
+  SESSION_STATUS_FAILED = 3;
+}
+
+enum ApplicationStatus {
+  APPLICATION_STATUS_UNSPECIFIED = 0;
+  APPLICATION_STATUS_DRAFT = 1;
+  APPLICATION_STATUS_QUALIFIED = 2;
+  APPLICATION_STATUS_REJECTED = 3;
+  APPLICATION_STATUS_NEEDS_HUMAN = 4;
+}
+
+// Explicit dialogue state machine. The LLM never picks this value.
+enum DialogueStage {
+  DIALOGUE_STAGE_UNSPECIFIED = 0;
+  DIALOGUE_STAGE_GREETING = 1;
+  DIALOGUE_STAGE_COLLECTING_CARGO = 2;
+  DIALOGUE_STAGE_COLLECTING_WEIGHT = 3;
+  DIALOGUE_STAGE_COLLECTING_VOLUME = 4;
+  DIALOGUE_STAGE_COLLECTING_ORIGIN = 5;
+  DIALOGUE_STAGE_COLLECTING_DESTINATION = 6;
+  DIALOGUE_STAGE_COLLECTING_READY_DATE = 7;
+  DIALOGUE_STAGE_COLLECTING_CONTACT = 8;
+  DIALOGUE_STAGE_READY_FOR_QUALIFICATION = 9;
+  DIALOGUE_STAGE_QUALIFIED = 10;
+  DIALOGUE_STAGE_REJECTED = 11;
+  DIALOGUE_STAGE_NEEDS_HUMAN = 12;
+  DIALOGUE_STAGE_COMPLETED = 13;
+}
+
+// ── Core data ───────────────────────────────────────────────────────────
+
+// Structured transport request. `optional` scalars map to `Option<T>` in Rust.
+message ApplicationState {
+  string cargo = 1;
+  optional double weight_kg = 2;
+  optional double volume_m3 = 3;
+  string origin_country = 4;
+  string origin_city = 5;
+  string destination_country = 6;
+  string destination_city = 7;
+  string ready_date = 8;
+  string contact = 9;
+  string special_requirements = 10;
+  string intent = 11;
+  string language = 12;
+  Qualification qualification = 13;
+  string qualification_reason = 14;
+  repeated string missing_fields = 15;
+}
+
+message Message {
+  string id = 1;
+  string session_id = 2;
+  Speaker speaker = 3;
+  string text = 4;
+  int64 created_at_unix_ms = 5;
+  string correlation_id = 6;
+  int64 processing_latency_ms = 7;
+  ApplicationState state_after = 8;
+}
+
+message Session {
+  string session_id = 1;
+  string call_id = 2;
+  string external_call_id = 3;
+  SessionStatus status = 4;
+  DialogueStage stage = 5;
+  int64 started_at_unix_ms = 6;
+  int64 ended_at_unix_ms = 7;
+  ApplicationState state = 8;
+  string application_id = 9;
+  string finish_reason = 10;
+  int64 avg_llm_latency_ms = 11;
+  int64 avg_stt_latency_ms = 12;
+  int64 avg_tts_latency_ms = 13;
+  int64 avg_total_latency_ms = 14;
+}
+
+message Application {
+  string id = 1;
+  string session_id = 2;
+  string call_id = 3;
+  ApplicationStatus status = 4;
+  ApplicationState state = 5;
+  string summary = 6;
+  repeated string missing_fields = 7;
+  int64 created_at_unix_ms = 8;
+  int64 updated_at_unix_ms = 9;
+  int32 turn_count = 10;
+}
+
+message EmailDraft {
+  string id = 1;
+  string application_id = 2;
+  string to = 3;
+  string subject = 4;
+  string plain_text_body = 5;
+  string html_body = 6;
+  int64 generated_at_unix_ms = 7;
+}
+
+message LatencyBreakdown {
+  int64 stt_ms = 1;
+  int64 llm_ms = 2;
+  int64 tts_ms = 3;
+  int64 total_ms = 4;
+  int64 first_token_ms = 5;
+}
+
+// ── Service ─────────────────────────────────────────────────────────────
+
+service AiService {
+  rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+  rpc ProcessTurn(ProcessTurnRequest) returns (ProcessTurnResponse);
+  rpc FinishSession(FinishSessionRequest) returns (FinishSessionResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc GetApplication(GetApplicationRequest) returns (GetApplicationResponse);
+  rpc StreamSessionEvents(StreamSessionEventsRequest) returns (stream SessionEvent);
+}
+
+message StartSessionRequest {
+  string external_call_id = 1;
+  string caller_phone = 2;
+  string language = 3;
+  string correlation_id = 4;
+  map<string, string> metadata = 5;
+}
+
+message StartSessionResponse {
+  string session_id = 1;
+  string call_id = 2;
+  string correlation_id = 3;
+  int64 started_at_unix_ms = 4;
+  ApplicationState state = 5;
+  string greeting = 6;
+  DialogueStage stage = 7;
+}
+
+message ProcessTurnRequest {
+  string session_id = 1;
+  string transcript = 2;
+  string correlation_id = 3;
+  int64 client_received_at_unix_ms = 4;
+  bool is_final = 5;
+}
+
+message ProcessTurnResponse {
+  string session_id = 1;
+  string reply_text = 2;
+  DialogueStage stage = 3;
+  ApplicationState state = 4;
+  bool finished = 5;
+  bool needs_human = 6;
+  LatencyBreakdown latency = 7;
+  Message agent_message = 8;
+}
+
+message FinishSessionRequest {
+  string session_id = 1;
+  string reason = 2;
+  string correlation_id = 3;
+}
+
+message FinishSessionResponse {
+  string session_id = 1;
+  Session session = 2;
+  Application application = 3;
+  EmailDraft email = 4;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+  bool include_messages = 2;
+  int32 message_limit = 3;
+}
+
+message GetSessionResponse {
+  Session session = 1;
+  repeated Message messages = 2;
+  ApplicationState state = 3;
+}
+
+message GetApplicationRequest {
+  string application_id = 1;
+}
+
+message GetApplicationResponse {
+  Application application = 1;
+  EmailDraft email = 2;
+}
+
+message StreamSessionEventsRequest {
+  optional string session_id = 1;
+}
+
+message SessionEvent {
+  string id = 1;
+  string session_id = 2;
+  string kind = 3;
+  int64 at_unix_ms = 4;
+  Speaker speaker = 5;
+  string text = 6;
+  DialogueStage stage = 7;
+  Qualification qualification = 8;
+  int64 latency_ms = 9;
+}

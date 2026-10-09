@@ -1,0 +1,24 @@
+[package]
+name = "mca-testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Deterministic fake providers and harness helpers for tests"
+
+[dependencies]
+mca-core.workspace = true
+mca-proto.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+uuid.workspace = true

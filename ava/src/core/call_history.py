@@ -1,0 +1,1257 @@
+"""
+Call History persistence layer.
+
+Stores call records in SQLite for historical analysis and debugging.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+import threading
+import uuid
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_EXTERNAL_ACTIVITY_MAX_ROWS = 5000
+
+
+@dataclass
+class CallRecord:
+    """Persisted call record for history and analytics."""
+    
+    # Core identifiers
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    call_id: str = ""
+    caller_number: Optional[str] = None
+    caller_name: Optional[str] = None
+    called_number: Optional[str] = None
+    
+    # Timing
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    duration_seconds: float = 0.0
+    
+    # Configuration
+    provider_name: str = "unknown"
+    pipeline_name: Optional[str] = None
+    pipeline_components: Dict[str, str] = field(default_factory=dict)
+    context_name: Optional[str] = None
+    routing_method: Optional[str] = None  # 'ai_agent' | 'ai_context' | 'default' | None
+    voice: Optional[str] = None  # Resolved session voice (None = provider default decided)
+    voice_source: Optional[str] = None  # 'override' | 'agent' | 'provider-default' | None
+
+    # Conversation
+    conversation_history: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Outcome
+    outcome: str = "completed"  # completed | transferred | error | abandoned | no_input_timeout
+    transfer_destination: Optional[str] = None
+    error_message: Optional[str] = None
+
+    # External dialer lifecycle (additive; null for ordinary AAVA calls).
+    external_platform: Optional[str] = None
+    external_call_id: Optional[str] = None
+    external_direction: Optional[str] = None
+    external_disposition: Optional[str] = None
+    external_metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Operator-selected enrichment only. Kept separate from external_metadata,
+    # which is owned by VICIdial/external dialer lifecycle integration.
+    call_metadata: Dict[str, str] = field(default_factory=dict)
+    call_metadata_updates: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Tool executions (debugging)
+    # tool_calls = append-only terminal in-call tool results. Entries retain
+    # legacy fields and include stable tool_call_id/status/target_id metadata.
+    # pre_call_tool_calls = pre-call enrichment tool execution metadata (lookup tools).
+    # post_call_tool_calls = post-call webhook/notification execution metadata (fire-and-forget).
+    # All three share the same per-entry shape (see ToolCallEntry typedef in admin_ui frontend).
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    pre_call_tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    post_call_tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Latency metrics (debugging)
+    avg_turn_latency_ms: float = 0.0
+    max_turn_latency_ms: float = 0.0
+    total_turns: int = 0
+    
+    # Audio stats (debugging)
+    caller_audio_format: str = "ulaw"
+    codec_alignment_ok: bool = True
+    barge_in_count: int = 0
+    diagnostics_snapshot: Dict[str, Any] = field(default_factory=dict)
+    
+    # Metadata
+    created_at: Optional[datetime] = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        data = asdict(self)
+        # Convert datetime objects to ISO strings
+        for key in ['start_time', 'end_time', 'created_at']:
+            if data[key] is not None:
+                data[key] = data[key].isoformat() if isinstance(data[key], datetime) else data[key]
+        return data
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CallRecord":
+        """Create CallRecord from dictionary."""
+        # Parse datetime strings back to datetime objects
+        for key in ['start_time', 'end_time', 'created_at']:
+            if data.get(key) and isinstance(data[key], str):
+                try:
+                    data[key] = datetime.fromisoformat(data[key])
+                except ValueError:
+                    data[key] = None
+        
+        # Parse JSON strings for complex fields
+        _list_fields = [
+            'conversation_history', 'tool_calls', 'pre_call_tool_calls',
+            'post_call_tool_calls', 'call_metadata_updates',
+        ]
+        for key in ['pipeline_components', 'external_metadata', 'call_metadata', 'diagnostics_snapshot', *_list_fields]:
+            if data.get(key) and isinstance(data[key], str):
+                try:
+                    data[key] = json.loads(data[key])
+                except json.JSONDecodeError:
+                    data[key] = [] if key in _list_fields else {}
+            elif data.get(key) is None:
+                # NULL columns on pre-migration rows must retain their declared
+                # collection type instead of overriding dataclass defaults with None.
+                data[key] = [] if key in _list_fields else {}
+        if not isinstance(data.get('call_metadata'), dict):
+            data['call_metadata'] = {}
+        if not isinstance(data.get('call_metadata_updates'), list):
+            data['call_metadata_updates'] = []
+        
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+class CallHistoryStore:
+    """SQLite-based call history storage."""
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape special characters for use in a SQL LIKE pattern with ESCAPE '\\'."""
+        return (
+            value
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
+    @staticmethod
+    def _split_values(value: Union[str, Iterable[str], None]) -> List[str]:
+        """Normalize a single value, a comma-separated string, or a list into distinct values."""
+        if value is None:
+            return []
+        items = value.split(",") if isinstance(value, str) else list(value)
+        values: List[str] = []
+        for item in items:
+            item = str(item).strip()
+            if item and item not in values:
+                values.append(item)
+        return values
+
+    @classmethod
+    def _build_filter_conditions(
+        cls,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        caller_number: Optional[str] = None,
+        caller_name: Optional[str] = None,
+        provider_name: Optional[str] = None,
+        pipeline_name: Optional[str] = None,
+        context_name: Optional[str] = None,
+        outcome: Union[str, Iterable[str], None] = None,
+        exclude_outcome: Union[str, Iterable[str], None] = None,
+        has_tool_calls: Optional[bool] = None,
+        min_duration: Optional[float] = None,
+        max_duration: Optional[float] = None,
+        transcript_search: Optional[str] = None,
+        call_metadata_key: Optional[str] = None,
+        call_metadata_value: Optional[str] = None,
+    ) -> Tuple[List[str], List[Any]]:
+        """Build the WHERE conditions shared by list(), count() and get_stats().
+
+        ``outcome`` keeps only the given outcomes and ``exclude_outcome`` drops
+        them; both accept one value, a comma-separated string or a list.
+        Records without an outcome are kept by ``exclude_outcome``.
+        """
+        conditions: List[str] = []
+        params: List[Any] = []
+
+        if start_date:
+            conditions.append("start_time >= ?")
+            params.append(start_date.isoformat())
+        if end_date:
+            conditions.append("start_time <= ?")
+            params.append(end_date.isoformat())
+        if caller_number:
+            conditions.append("caller_number LIKE ?")
+            params.append(f"%{caller_number}%")
+        if caller_name:
+            conditions.append("caller_name LIKE ?")
+            params.append(f"%{caller_name}%")
+        if provider_name:
+            # LOW-CH3: case-insensitive match so mixed-case legacy rows
+            # bucket together with normalized writes.
+            conditions.append("LOWER(provider_name) = ?")
+            params.append(provider_name.lower())
+        if pipeline_name:
+            conditions.append("pipeline_name = ?")
+            params.append(pipeline_name)
+        if context_name:
+            conditions.append("context_name = ?")
+            params.append(context_name)
+        outcomes = cls._split_values(outcome)
+        if outcomes:
+            conditions.append(f"outcome IN ({', '.join('?' for _ in outcomes)})")
+            params.extend(outcomes)
+        excluded = cls._split_values(exclude_outcome)
+        if excluded:
+            conditions.append(f"(outcome IS NULL OR outcome NOT IN ({', '.join('?' for _ in excluded)}))")
+            params.extend(excluded)
+        if has_tool_calls is not None:
+            if has_tool_calls:
+                conditions.append("tool_calls IS NOT NULL AND tool_calls != '[]'")
+            else:
+                conditions.append("(tool_calls IS NULL OR tool_calls = '[]')")
+        if min_duration is not None:
+            conditions.append("duration_seconds >= ?")
+            params.append(min_duration)
+        if max_duration is not None:
+            conditions.append("duration_seconds <= ?")
+            params.append(max_duration)
+        if transcript_search:
+            escaped = cls._escape_like(transcript_search)
+            conditions.append("LOWER(conversation_history) LIKE LOWER(?) ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        if call_metadata_key is not None and call_metadata_value is not None:
+            from src.core.call_metadata import call_metadata_json_path
+
+            conditions.append("CAST(json_extract(call_metadata, ?) AS TEXT) = ?")
+            params.extend([call_metadata_json_path(call_metadata_key), call_metadata_value])
+
+        return conditions, params
+
+    _CREATE_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS call_records (
+        id TEXT PRIMARY KEY,
+        call_id TEXT NOT NULL,
+        caller_number TEXT,
+        caller_name TEXT,
+        called_number TEXT,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        duration_seconds REAL,
+        provider_name TEXT,
+        pipeline_name TEXT,
+        pipeline_components TEXT,
+        context_name TEXT,
+        routing_method TEXT,
+        voice TEXT,
+        voice_source TEXT,
+        conversation_history TEXT,
+        outcome TEXT,
+        transfer_destination TEXT,
+        error_message TEXT,
+        external_platform TEXT,
+        external_call_id TEXT,
+        external_direction TEXT,
+        external_disposition TEXT,
+        external_metadata TEXT,
+        call_metadata TEXT,
+        call_metadata_updates TEXT,
+        tool_calls TEXT,
+        pre_call_tool_calls TEXT,
+        post_call_tool_calls TEXT,
+        avg_turn_latency_ms REAL,
+        max_turn_latency_ms REAL,
+        total_turns INTEGER,
+        caller_audio_format TEXT,
+        codec_alignment_ok INTEGER,
+        barge_in_count INTEGER,
+        diagnostics_snapshot TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    
+    _CREATE_INDEXES_SQL = [
+        "CREATE INDEX IF NOT EXISTS idx_call_records_start_time ON call_records(start_time)",
+        "CREATE INDEX IF NOT EXISTS idx_call_records_external_platform_start ON call_records(external_platform COLLATE NOCASE, start_time)",
+        "CREATE INDEX IF NOT EXISTS idx_call_records_caller_number ON call_records(caller_number)",
+        "CREATE INDEX IF NOT EXISTS idx_call_records_outcome ON call_records(outcome)",
+        "CREATE INDEX IF NOT EXISTS idx_call_records_provider ON call_records(provider_name)",
+        "CREATE INDEX IF NOT EXISTS idx_call_records_pipeline ON call_records(pipeline_name)",
+        "CREATE INDEX IF NOT EXISTS idx_call_records_context ON call_records(context_name)",
+    ]
+
+    def __init__(self, db_path: Optional[str] = None):
+        """
+        Initialize call history store.
+        
+        Args:
+            db_path: Path to SQLite database file. Defaults to data/call_history.db
+        """
+        self._db_path = db_path or os.getenv(
+            "CALL_HISTORY_DB_PATH", 
+            "/app/data/call_history.db"
+        )
+        self._retention_days = int(os.getenv("CALL_HISTORY_RETENTION_DAYS", "0"))
+        self._enabled = os.getenv("CALL_HISTORY_ENABLED", "true").lower() in ("true", "1", "yes")
+        self._lock = threading.Lock()
+        self._initialized = False
+        
+        if self._enabled:
+            self._init_db()
+    
+    def _init_db(self) -> None:
+        """Initialize database and create tables."""
+        try:
+            # Ensure directory exists
+            db_dir = os.path.dirname(self._db_path)
+            if db_dir:
+                Path(db_dir).mkdir(parents=True, exist_ok=True)
+            
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(self._CREATE_TABLE_SQL)
+                    self._ensure_schema_sync(conn)
+                    for idx_sql in self._CREATE_INDEXES_SQL:
+                        cursor.execute(idx_sql)
+                    conn.commit()
+                    self._initialized = True
+                    logger.info(f"Call history database initialized: {self._db_path}")
+                finally:
+                    conn.close()
+        except Exception as e:
+            logger.error(f"Failed to initialize call history database: {e}", exc_info=True)
+            self._enabled = False
+
+    def _ensure_schema_sync(self, conn: sqlite3.Connection) -> None:
+        """
+        Best-effort additive migrations for existing installs.
+
+        SQLite has limited ALTER TABLE support; we only add nullable columns when
+        missing — never drop or rename. Failures are logged and never block startup.
+        """
+        try:
+            cur = conn.cursor()
+            existing = {str(r[1]) for r in cur.execute("PRAGMA table_info(call_records)").fetchall()}
+            if "pre_call_tool_calls" not in existing:
+                cur.execute("ALTER TABLE call_records ADD COLUMN pre_call_tool_calls TEXT")
+            if "post_call_tool_calls" not in existing:
+                cur.execute("ALTER TABLE call_records ADD COLUMN post_call_tool_calls TEXT")
+            if "routing_method" not in existing:
+                cur.execute("ALTER TABLE call_records ADD COLUMN routing_method TEXT")
+            if "voice" not in existing:
+                cur.execute("ALTER TABLE call_records ADD COLUMN voice TEXT")
+            if "voice_source" not in existing:
+                cur.execute("ALTER TABLE call_records ADD COLUMN voice_source TEXT")
+            additive_columns = {
+                "called_number": "TEXT",
+                "external_platform": "TEXT",
+                "external_call_id": "TEXT",
+                "external_direction": "TEXT",
+                "external_disposition": "TEXT",
+                "external_metadata": "TEXT",
+                "call_metadata": "TEXT",
+                "call_metadata_updates": "TEXT",
+                "diagnostics_snapshot": "TEXT",
+            }
+            for name, sql_type in additive_columns.items():
+                if name not in existing:
+                    cur.execute(f"ALTER TABLE call_records ADD COLUMN {name} {sql_type}")
+        except Exception:
+            logger.debug("call_records schema migration failed (non-fatal)", exc_info=True)
+    
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a database connection with WAL mode and busy timeout for multi-process safety."""
+        conn = sqlite3.connect(self._db_path, timeout=30.0, check_same_thread=False)  # 30s busy timeout
+        conn.row_factory = sqlite3.Row
+        # Enable WAL mode for better concurrent read/write performance
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")  # 30s in milliseconds
+        conn.execute("PRAGMA foreign_keys=ON;")
+        return conn
+    
+    async def save(self, record: CallRecord) -> bool:
+        """
+        Save a call record to the database.
+        
+        Args:
+            record: CallRecord to save
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self._enabled:
+            return False
+        
+        def _save_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    from src.core.call_metadata import (
+                        normalize_call_metadata_updates,
+                        validate_call_metadata_document,
+                    )
+
+                    call_metadata = validate_call_metadata_document(record.call_metadata or {})
+                    call_metadata_updates = normalize_call_metadata_updates(
+                        record.call_metadata_updates or []
+                    )
+                    cursor = conn.cursor()
+                    # Check if record with same call_id already exists (prevent duplicates)
+                    cursor.execute("SELECT id FROM call_records WHERE call_id = ?", (record.call_id,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        # Already saved, skip duplicate
+                        return True
+                    
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO call_records (
+                            id, call_id, caller_number, caller_name, called_number,
+                            start_time, end_time, duration_seconds,
+                            provider_name, pipeline_name, pipeline_components, context_name,
+                            routing_method, voice, voice_source,
+                            conversation_history, outcome, transfer_destination, error_message,
+                            external_platform, external_call_id, external_direction,
+                            external_disposition, external_metadata,
+                            call_metadata, call_metadata_updates,
+                            tool_calls, pre_call_tool_calls, post_call_tool_calls,
+                            avg_turn_latency_ms, max_turn_latency_ms, total_turns,
+                            caller_audio_format, codec_alignment_ok, barge_in_count,
+                            diagnostics_snapshot, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        record.id,
+                        record.call_id,
+                        record.caller_number,
+                        record.caller_name,
+                        record.called_number,
+                        record.start_time.isoformat() if record.start_time else None,
+                        record.end_time.isoformat() if record.end_time else None,
+                        record.duration_seconds,
+                        # LOW-CH3: normalize provider casing at write so stored values
+                        # match the case-insensitive filter / provider-health buckets.
+                        (record.provider_name or "unknown").lower(),
+                        record.pipeline_name,
+                        json.dumps(record.pipeline_components),
+                        record.context_name,
+                        record.routing_method,
+                        record.voice,
+                        record.voice_source,
+                        json.dumps(record.conversation_history),
+                        record.outcome,
+                        record.transfer_destination,
+                        record.error_message,
+                        record.external_platform,
+                        record.external_call_id,
+                        record.external_direction,
+                        record.external_disposition,
+                        json.dumps(record.external_metadata),
+                        json.dumps(call_metadata),
+                        json.dumps(call_metadata_updates),
+                        json.dumps(record.tool_calls),
+                        json.dumps(record.pre_call_tool_calls),
+                        json.dumps(record.post_call_tool_calls),
+                        record.avg_turn_latency_ms,
+                        record.max_turn_latency_ms,
+                        record.total_turns,
+                        record.caller_audio_format,
+                        1 if record.codec_alignment_ok else 0,
+                        record.barge_in_count,
+                        json.dumps(record.diagnostics_snapshot or {}),
+                        record.created_at.isoformat() if record.created_at else None,
+                    ))
+                    conn.commit()
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to save call record {record.call_id}: {e}")
+                    return False
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _save_sync)
+    
+    # ---------------------------------------------------------------
+    # Phase-tool execution metadata (pre-call / post-call)
+    #
+    # Pre-call tools run synchronously before the AI greets, so their entries
+    # could in principle be inlined into the initial save(). We still expose
+    # the same append/update API as post-call to keep the engine code symmetric.
+    #
+    # Post-call tools are fire-and-forget; the call_records row is written
+    # *before* tools complete, then each tool calls append_phase_tool() to
+    # add a `pending` placeholder and update_phase_tool() to record its result.
+    # Read-modify-write is serialized by self._lock + SQLite WAL so concurrent
+    # tools for the same call don't clobber each other.
+    # ---------------------------------------------------------------
+
+    _PHASE_COLUMN = {"pre_call": "pre_call_tool_calls", "post_call": "post_call_tool_calls"}
+
+    async def append_phase_tool(self, call_id: str, phase: str, record: Dict[str, Any]) -> bool:
+        """
+        Append a tool-execution entry to either pre_call_tool_calls or post_call_tool_calls.
+
+        Used at scheduling time to write a `pending` placeholder. If the call_records
+        row is missing (race with persist), returns False — the engine should ensure
+        persist runs first.
+        """
+        column = self._PHASE_COLUMN.get(phase)
+        if not self._enabled or column is None:
+            return False
+
+        def _sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(f"SELECT {column} FROM call_records WHERE call_id = ?", (call_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        return False
+                    existing_raw = row[0] if not isinstance(row, sqlite3.Row) else row[column]
+                    try:
+                        entries = json.loads(existing_raw) if existing_raw else []
+                    except (TypeError, json.JSONDecodeError):
+                        entries = []
+                    if not isinstance(entries, list):
+                        entries = []
+                    entries.append(record)
+                    cur.execute(
+                        f"UPDATE call_records SET {column} = ? WHERE call_id = ?",
+                        (json.dumps(entries), call_id),
+                    )
+                    conn.commit()
+                    return True
+                except Exception as exc:
+                    logger.error(
+                        "append_phase_tool failed",
+                        extra={"call_id": call_id, "phase": phase, "error": str(exc)},
+                    )
+                    return False
+                finally:
+                    conn.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _sync)
+
+    async def update_phase_tool(
+        self,
+        call_id: str,
+        phase: str,
+        tool_name: str,
+        started_at: Optional[str],
+        updates: Dict[str, Any],
+    ) -> bool:
+        """
+        Merge ``updates`` into an existing entry in ``<phase>_tool_calls`` matched by
+        (``name`` == ``tool_name``, ``started_at`` == ``started_at``). If ``started_at``
+        is None, matches by name and updates the most recent entry. If no entry matches,
+        appends a new one (keeps the API forgiving for callers that skipped the pending
+        placeholder).
+        """
+        column = self._PHASE_COLUMN.get(phase)
+        if not self._enabled or column is None:
+            return False
+
+        def _sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(f"SELECT {column} FROM call_records WHERE call_id = ?", (call_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        return False
+                    existing_raw = row[0] if not isinstance(row, sqlite3.Row) else row[column]
+                    try:
+                        entries = json.loads(existing_raw) if existing_raw else []
+                    except (TypeError, json.JSONDecodeError):
+                        entries = []
+                    if not isinstance(entries, list):
+                        entries = []
+
+                    target_idx = None
+                    for i, entry in enumerate(entries):
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get("name") != tool_name:
+                            continue
+                        if started_at is None or entry.get("started_at") == started_at:
+                            target_idx = i  # keep iterating to land on most recent match
+                    if target_idx is None:
+                        merged = {"name": tool_name}
+                        if started_at is not None:
+                            merged["started_at"] = started_at
+                        merged.update(updates)
+                        entries.append(merged)
+                    else:
+                        entries[target_idx] = {**entries[target_idx], **updates}
+
+                    cur.execute(
+                        f"UPDATE call_records SET {column} = ? WHERE call_id = ?",
+                        (json.dumps(entries), call_id),
+                    )
+                    conn.commit()
+                    return True
+                except Exception as exc:
+                    logger.error(
+                        "update_phase_tool failed",
+                        extra={"call_id": call_id, "phase": phase, "tool": tool_name, "error": str(exc)},
+                    )
+                    return False
+                finally:
+                    conn.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _sync)
+
+    async def get(self, record_id: str) -> Optional[CallRecord]:
+        """
+        Get a call record by ID.
+        
+        Args:
+            record_id: UUID of the record
+            
+        Returns:
+            CallRecord if found, None otherwise
+        """
+        if not self._enabled:
+            return None
+        
+        def _get_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT * FROM call_records WHERE id = ?", (record_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        return CallRecord.from_dict(dict(row))
+                    return None
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get_sync)
+    
+    async def get_by_call_id(self, call_id: str) -> Optional[CallRecord]:
+        """
+        Get a call record by Asterisk call ID.
+        
+        Args:
+            call_id: Asterisk channel ID
+            
+        Returns:
+            CallRecord if found, None otherwise
+        """
+        if not self._enabled:
+            return None
+        
+        def _get_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT * FROM call_records WHERE call_id = ?", (call_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        return CallRecord.from_dict(dict(row))
+                    return None
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get_sync)
+
+    async def update_external_lifecycle(
+        self,
+        call_id: str,
+        *,
+        external_disposition: Optional[str],
+        external_metadata: Dict[str, Any],
+    ) -> bool:
+        """Merge a late external-dialer result into an existing history row.
+
+        Durable external-dialer retries can finish after normal call cleanup has
+        already saved Call History. Keep the original call record intact while
+        appending retry events and replacing only lifecycle summary fields. A
+        missing row is a successful no-op (history may be disabled, expired, or
+        not yet written); database failures return ``False`` so the durable
+        action remains retryable.
+        """
+        if not self._enabled:
+            return True
+
+        def _update_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT external_metadata FROM call_records WHERE call_id = ?",
+                        (call_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return True
+
+                    try:
+                        current = json.loads(row["external_metadata"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        current = {}
+                    if not isinstance(current, dict):
+                        current = {}
+
+                    updates = dict(external_metadata or {})
+                    previous_events = current.get("events")
+                    retry_events = updates.pop("events", None)
+                    current.update(updates)
+                    if isinstance(retry_events, list):
+                        current["events"] = [
+                            *(previous_events if isinstance(previous_events, list) else []),
+                            *retry_events,
+                        ]
+
+                    cursor.execute(
+                        """
+                        UPDATE call_records
+                        SET external_disposition = ?, external_metadata = ?
+                        WHERE call_id = ?
+                        """,
+                        (
+                            external_disposition,
+                            json.dumps(current),
+                            call_id,
+                        ),
+                    )
+                    conn.commit()
+                    return True
+                except Exception as exc:
+                    logger.error(
+                        "Failed to update external lifecycle for call %s: %s",
+                        call_id,
+                        exc,
+                    )
+                    return False
+                finally:
+                    conn.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _update_sync)
+    
+    async def list(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        caller_number: Optional[str] = None,
+        caller_name: Optional[str] = None,
+        provider_name: Optional[str] = None,
+        pipeline_name: Optional[str] = None,
+        context_name: Optional[str] = None,
+        outcome: Union[str, Iterable[str], None] = None,
+        exclude_outcome: Union[str, Iterable[str], None] = None,
+        has_tool_calls: Optional[bool] = None,
+        min_duration: Optional[float] = None,
+        max_duration: Optional[float] = None,
+        transcript_search: Optional[str] = None,
+        call_metadata_key: Optional[str] = None,
+        call_metadata_value: Optional[str] = None,
+        order_by: str = "start_time",
+        order_dir: str = "DESC",
+        include_details: bool = True,
+    ) -> List[CallRecord]:
+        """
+        List call records with filtering and pagination.
+        
+        Args:
+            limit: Maximum records to return
+            offset: Records to skip
+            start_date: Filter by start date (inclusive)
+            end_date: Filter by end date (inclusive)
+            caller_number: Filter by caller number (partial match)
+            caller_name: Filter by caller name (partial match)
+            provider_name: Filter by provider
+            pipeline_name: Filter by pipeline
+            context_name: Filter by context
+            outcome: Keep only these outcomes (single value, comma list or list)
+            exclude_outcome: Drop these outcomes (records without outcome are kept)
+            has_tool_calls: Filter calls with/without tool calls
+            min_duration: Minimum duration in seconds
+            max_duration: Maximum duration in seconds
+            transcript_search: Case-insensitive search in the transcript
+            order_by: Column to order by
+            order_dir: ASC or DESC
+            include_details: If False, excludes large payload fields (transcript/tool JSON)
+            
+        Returns:
+            List of CallRecord objects
+        """
+        if not self._enabled:
+            return []
+        
+        def _list_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    conditions, params = self._build_filter_conditions(
+                        start_date=start_date,
+                        end_date=end_date,
+                        caller_number=caller_number,
+                        caller_name=caller_name,
+                        provider_name=provider_name,
+                        pipeline_name=pipeline_name,
+                        context_name=context_name,
+                        outcome=outcome,
+                        exclude_outcome=exclude_outcome,
+                        has_tool_calls=has_tool_calls,
+                        min_duration=min_duration,
+                        max_duration=max_duration,
+                        transcript_search=transcript_search,
+                        call_metadata_key=call_metadata_key,
+                        call_metadata_value=call_metadata_value,
+                    )
+
+                    # Validate order_by to prevent SQL injection
+                    valid_columns = [
+                        'start_time', 'end_time', 'duration_seconds', 
+                        'caller_number', 'caller_name', 'provider_name', 'pipeline_name',
+                        'context_name', 'outcome', 'created_at'
+                    ]
+                    safe_order_by = order_by if order_by in valid_columns else 'start_time'
+                    safe_order_dir = order_dir.upper() if order_dir.upper() in ['ASC', 'DESC'] else 'DESC'
+                    
+                    where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+                    select_cols = "*"
+                    if not include_details:
+                        # Exclude transcript/tool payloads to keep list views fast and reduce exposure.
+                        select_cols = ", ".join([
+                            "id",
+                            "call_id",
+                            "caller_number",
+                            "caller_name",
+                            "called_number",
+                            "start_time",
+                            "end_time",
+                            "duration_seconds",
+                            "provider_name",
+                            "pipeline_name",
+                            "pipeline_components",
+                            "context_name",
+                            "routing_method",
+                            "outcome",
+                            "transfer_destination",
+                            "error_message",
+                            "external_platform",
+                            "external_call_id",
+                            "external_direction",
+                            "external_disposition",
+                            "avg_turn_latency_ms",
+                            "max_turn_latency_ms",
+                            "total_turns",
+                            "caller_audio_format",
+                            "codec_alignment_ok",
+                            "barge_in_count",
+                            "created_at",
+                        ])
+
+                    query = f"""
+                        SELECT {select_cols} FROM call_records 
+                        WHERE {where_clause}
+                        ORDER BY {safe_order_by} {safe_order_dir}
+                        LIMIT ? OFFSET ?
+                    """
+                    params.extend([limit, offset])
+                    
+                    cursor = conn.cursor()
+                    cursor.execute(query, params)
+                    rows = cursor.fetchall()
+                    return [CallRecord.from_dict(dict(row)) for row in rows]
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _list_sync)
+
+    async def list_external_activity(
+        self,
+        platform: str,
+        start_date: datetime,
+        end_date: Optional[datetime] = None,
+        max_rows: int = DEFAULT_EXTERNAL_ACTIVITY_MAX_ROWS,
+        mapping_id: Optional[str] = None,
+    ) -> List[CallRecord]:
+        """Return lightweight external-dialer records for bounded activity summaries.
+
+        The query intentionally includes ``external_metadata`` (mapping and
+        VICIdial lifecycle state) while excluding transcripts, tool payloads,
+        and latency detail. Callers must provide a start date so this cannot
+        accidentally become an unbounded history export.
+        """
+        if not self._enabled:
+            return []
+
+        normalized_platform = str(platform or "").strip().lower()
+        if not normalized_platform:
+            return []
+        normalized_mapping_id = str(mapping_id or "").strip()
+        bounded_max_rows = max(1, min(int(max_rows), 50000))
+
+        def _list_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    conditions = [
+                        "external_platform = ? COLLATE NOCASE",
+                        "start_time >= ?",
+                    ]
+                    params: List[Any] = [normalized_platform, start_date.isoformat()]
+                    if end_date:
+                        conditions.append("start_time <= ?")
+                        params.append(end_date.isoformat())
+                    if normalized_mapping_id:
+                        # Filter before LIMIT so activity from other mappings
+                        # cannot crowd the requested mapping out of the bounded
+                        # result set.
+                        conditions.append(
+                            "json_extract(external_metadata, '$.mapping_id') = ?"
+                        )
+                        params.append(normalized_mapping_id)
+
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        f"""
+                        SELECT
+                            id, call_id, caller_number, called_number,
+                            start_time, end_time, duration_seconds,
+                            context_name, outcome, error_message,
+                            external_platform, external_call_id,
+                            external_direction, external_disposition,
+                            external_metadata
+                        FROM call_records
+                        WHERE {' AND '.join(conditions)}
+                        ORDER BY start_time DESC
+                        LIMIT ?
+                        """,
+                        [*params, bounded_max_rows],
+                    )
+                    return [CallRecord.from_dict(dict(row)) for row in cursor.fetchall()]
+                finally:
+                    conn.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _list_sync)
+    
+    async def count(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        caller_number: Optional[str] = None,
+        caller_name: Optional[str] = None,
+        provider_name: Optional[str] = None,
+        pipeline_name: Optional[str] = None,
+        context_name: Optional[str] = None,
+        outcome: Union[str, Iterable[str], None] = None,
+        exclude_outcome: Union[str, Iterable[str], None] = None,
+        has_tool_calls: Optional[bool] = None,
+        min_duration: Optional[float] = None,
+        max_duration: Optional[float] = None,
+        transcript_search: Optional[str] = None,
+        call_metadata_key: Optional[str] = None,
+        call_metadata_value: Optional[str] = None,
+    ) -> int:
+        """Count records matching filters."""
+        if not self._enabled:
+            return 0
+        
+        def _count_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    conditions, params = self._build_filter_conditions(
+                        start_date=start_date,
+                        end_date=end_date,
+                        caller_number=caller_number,
+                        caller_name=caller_name,
+                        provider_name=provider_name,
+                        pipeline_name=pipeline_name,
+                        context_name=context_name,
+                        outcome=outcome,
+                        exclude_outcome=exclude_outcome,
+                        has_tool_calls=has_tool_calls,
+                        min_duration=min_duration,
+                        max_duration=max_duration,
+                        transcript_search=transcript_search,
+                        call_metadata_key=call_metadata_key,
+                        call_metadata_value=call_metadata_value,
+                    )
+
+                    where_clause = " AND ".join(conditions) if conditions else "1=1"
+                    query = f"SELECT COUNT(*) FROM call_records WHERE {where_clause}"
+                    
+                    cursor = conn.cursor()
+                    cursor.execute(query, params)
+                    return cursor.fetchone()[0]
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _count_sync)
+    
+    async def delete(self, record_id: str) -> bool:
+        """Delete a call record by ID."""
+        if not self._enabled:
+            return False
+        
+        def _delete_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM call_records WHERE id = ?", (record_id,))
+                    conn.commit()
+                    return cursor.rowcount > 0
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _delete_sync)
+    
+    async def delete_before(self, before_date: datetime) -> int:
+        """Delete all records before a date. Returns count deleted."""
+        if not self._enabled:
+            return 0
+        
+        def _delete_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "DELETE FROM call_records WHERE start_time < ?",
+                        (before_date.isoformat(),)
+                    )
+                    conn.commit()
+                    return cursor.rowcount
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _delete_sync)
+    
+    async def get_stats(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        **filters: Any,
+    ) -> Dict[str, Any]:
+        """
+        Get aggregate statistics for the dashboard.
+
+        Accepts the same filters as list()/count() so the statistics always
+        describe the records the operator is currently looking at.
+        
+        Returns:
+            Dictionary with stats: total_calls, avg_duration, outcomes, providers, etc.
+        """
+        if not self._enabled:
+            return {}
+        
+        def _stats_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    
+                    conditions, params = self._build_filter_conditions(
+                        start_date=start_date, end_date=end_date, **filters
+                    )
+                    where_clause = " AND ".join(conditions) if conditions else "1=1"
+                    
+                    # Total calls and duration stats
+                    cursor.execute(f"""
+                        SELECT 
+                            COUNT(*) as total_calls,
+                            AVG(duration_seconds) as avg_duration,
+                            MAX(duration_seconds) as max_duration,
+                            MIN(duration_seconds) as min_duration,
+                            SUM(duration_seconds) as total_duration,
+                            AVG(avg_turn_latency_ms) as avg_latency,
+                            SUM(total_turns) as total_turns,
+                            SUM(barge_in_count) as total_barge_ins
+                        FROM call_records WHERE {where_clause}
+                    """, params)
+                    row = cursor.fetchone()
+                    stats = {
+                        "total_calls": row[0] or 0,
+                        "avg_duration_seconds": round(row[1] or 0, 2),
+                        "max_duration_seconds": round(row[2] or 0, 2),
+                        "min_duration_seconds": round(row[3] or 0, 2),
+                        "total_duration_seconds": round(row[4] or 0, 2),
+                        "avg_latency_ms": round(row[5] or 0, 2),
+                        "total_turns": row[6] or 0,
+                        "total_barge_ins": row[7] or 0,
+                    }
+                    
+                    # Outcome breakdown
+                    cursor.execute(f"""
+                        SELECT outcome, COUNT(*) as count
+                        FROM call_records WHERE {where_clause}
+                        GROUP BY outcome
+                    """, params)
+                    stats["outcomes"] = {row[0]: row[1] for row in cursor.fetchall()}
+                    
+                    # Provider usage
+                    cursor.execute(f"""
+                        SELECT provider_name, COUNT(*) as count
+                        FROM call_records WHERE {where_clause}
+                        GROUP BY provider_name
+                    """, params)
+                    stats["providers"] = {row[0]: row[1] for row in cursor.fetchall()}
+                    
+                    # Pipeline usage
+                    cursor.execute(f"""
+                        SELECT pipeline_name, COUNT(*) as count
+                        FROM call_records WHERE {where_clause} AND pipeline_name IS NOT NULL
+                        GROUP BY pipeline_name
+                    """, params)
+                    stats["pipelines"] = {row[0]: row[1] for row in cursor.fetchall()}
+                    
+                    # Context usage
+                    cursor.execute(f"""
+                        SELECT context_name, COUNT(*) as count
+                        FROM call_records WHERE {where_clause} AND context_name IS NOT NULL
+                        GROUP BY context_name
+                    """, params)
+                    stats["contexts"] = {row[0]: row[1] for row in cursor.fetchall()}
+                    
+                    # Calls per day (last 30 days)
+                    cursor.execute(f"""
+                        SELECT DATE(start_time) as day, COUNT(*) as count
+                        FROM call_records 
+                        WHERE {where_clause}
+                        GROUP BY DATE(start_time)
+                        ORDER BY day DESC
+                        LIMIT 30
+                    """, params)
+                    stats["calls_per_day"] = [
+                        {"date": row[0], "count": row[1]} 
+                        for row in cursor.fetchall()
+                    ]
+                    
+                    # Top callers
+                    cursor.execute(f"""
+                        SELECT caller_number, COUNT(*) as count
+                        FROM call_records 
+                        WHERE {where_clause} AND caller_number IS NOT NULL
+                        GROUP BY caller_number
+                        ORDER BY count DESC
+                        LIMIT 10
+                    """, params)
+                    stats["top_callers"] = [
+                        {"number": row[0], "count": row[1]} 
+                        for row in cursor.fetchall()
+                    ]
+                    
+                    # Tool usage stats
+                    cursor.execute(f"""
+                        SELECT COUNT(*) FROM call_records 
+                        WHERE {where_clause} AND tool_calls != '[]'
+                    """, params)
+                    stats["calls_with_tools"] = cursor.fetchone()[0]
+                    
+                    # Top tools aggregation (parse JSON tool_calls field)
+                    cursor.execute(f"""
+                        SELECT tool_calls FROM call_records 
+                        WHERE {where_clause} AND tool_calls != '[]'
+                    """, params)
+                    tool_counts: Dict[str, int] = {}
+                    for row in cursor.fetchall():
+                        try:
+                            tools = json.loads(row[0]) if row[0] else []
+                            for tool in tools:
+                                name = tool.get("name", "unknown")
+                                tool_counts[name] = tool_counts.get(name, 0) + 1
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    stats["top_tools"] = dict(sorted(tool_counts.items(), key=lambda x: x[1], reverse=True)[:10])
+                    
+                    return stats
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _stats_sync)
+    
+    async def cleanup_old_records(self) -> int:
+        """
+        Delete records older than retention period.
+        
+        Returns:
+            Number of records deleted
+        """
+        if not self._enabled or self._retention_days <= 0:
+            return 0
+        
+        # UTC-aware to match stored start_time (ISO with +00:00); a naive local
+        # cutoff would string-compare incorrectly against the stored values (LOW-CH4).
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self._retention_days)
+        deleted = await self.delete_before(cutoff)
+        if deleted > 0:
+            logger.info(f"Cleaned up {deleted} old call history records (retention: {self._retention_days} days)")
+        return deleted
+    
+    async def get_distinct_values(self, column: str) -> List[str]:
+        """Get distinct values for a column (for filter dropdowns)."""
+        if not self._enabled:
+            return []
+        
+        valid_columns = ['provider_name', 'pipeline_name', 'context_name', 'outcome']
+        if column not in valid_columns:
+            return []
+        
+        def _get_sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(f"""
+                        SELECT DISTINCT {column} FROM call_records 
+                        WHERE {column} IS NOT NULL
+                        ORDER BY {column}
+                    """)
+                    return [row[0] for row in cursor.fetchall()]
+                finally:
+                    conn.close()
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get_sync)
+
+
+# Global instance (lazy initialization)
+_call_history_store: Optional[CallHistoryStore] = None
+
+
+def get_call_history_store() -> CallHistoryStore:
+    """Get the global call history store instance."""
+    global _call_history_store
+    if _call_history_store is None:
+        _call_history_store = CallHistoryStore()
+    return _call_history_store

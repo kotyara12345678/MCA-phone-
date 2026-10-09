@@ -1,0 +1,15 @@
+target/
+**/*.rs.bk
+*.pdb
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+.next/
+node_modules/
+coverage/
+.tmp/
+/tmp/
+e2e-artifacts/

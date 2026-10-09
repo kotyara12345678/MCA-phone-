@@ -1,0 +1,596 @@
+# MCA-phone voice channel — ai-agent.yaml for AVA (Asterisk AI Voice Agent).
+#
+# Deployment file for prod/ (docker-compose.yml mounts it over
+# /app/config/ai-agent.yaml). Personas, MCA tools and endpoint wiring for the
+# MCA Logistics voice channel.
+#
+# Authority model: the MCA REST API (crates/mca-mail) is the single source of
+# truth. This agent only proposes — qualification, blocking-gap logic and
+# manager handoff are decided server-side. The agent never invents prices,
+# tariffs, trucks, customs or legal terms: it collects verified facts and
+# escalates.
+
+config_version: 6
+
+# Provider selection (see providers: below). Keys come from .env.
+default_provider: mca_hybrid
+active_pipeline: mca_hybrid
+
+asterisk:
+  app_name: mca-phone-voice-agent
+  # ARI call-control keepalive. Detects a silent network path in ~20s.
+  ws_ping_interval_sec: 10
+  ws_ping_timeout_sec: 10
+
+# AudioSocket, not file-based: works without shared storage with Asterisk.
+audio_transport: audiosocket
+audiosocket:
+  format: ulaw
+  host: 127.0.0.1
+  port: 8090
+  # Set when the AI engine sits behind NAT/VPN relative to Asterisk:
+  # advertise_host: "10.8.0.5"
+
+downstream_mode: stream
+
+barge_in:
+  enabled: true
+  initial_protection_ms: 400
+  min_ms: 250
+  energy_threshold: 1000
+  cooldown_ms: 500
+  post_tts_end_protection_ms: 250
+
+streaming:
+  sample_rate: 8000
+  jitter_buffer_ms: 100
+  keepalive_interval_ms: 5000
+  connection_timeout_ms: 10000
+  fallback_timeout_ms: 8000
+  chunk_size_ms: 20
+  min_start_ms: 300
+  low_watermark_ms: 200
+  provider_grace_ms: 500
+  logging_level: info
+  diag_enable_taps: false
+  diag_out_dir: /tmp/ai-engine-taps
+
+# Caller inactivity watchdog.
+no_input:
+  enabled: true
+  inbound_enabled: true
+  outbound_enabled: false
+  initial_timeout_sec: 30
+  grace_timeout_sec: 15
+  max_check_ins: 1
+  check_in_message: "Вы меня слышите?"
+  final_message: "Я вас не слышу, поэтому завершаю звонок. До свидания!"
+
+on_provider_failure: announce_hangup
+provider_failure_prompt: sorry-youre-having-problems
+contexts: {}
+
+llm:
+  initial_greeting: >-
+    Добрый день! Это компания MCA, отдел грузоперевозок. Подскажите, что вам
+    нужно перевезти?
+  prompt: >-
+    Ты — голосовой ассистент компании MCA (логистика и грузоперевозки по
+    России и СНГ). Общайся по-русски, кратко и по делу.
+
+    ОБЯЗАТЕЛЬНО:
+    - В самом начале звонка вызывай mca_get_requirements: если клиент уже
+      звонил, CRM вернёт собранные факты и список asked_questions — это
+      продолжение разговора, а не новый лид.
+    - Список asked_questions в ответе mca_get_requirements — вопросы,
+      которые тебе уже задавали (question) и был ли на них ответ клиента
+      (answered). Вопросы с answered=true закрыты — никогда их не
+      переспрашивай; answered=false ещё без ответа — при необходимости можно
+      уточнить.
+    - Собери проверенные факты о перевозке: компания и ИНН (если называют),
+      описание груза, города забора и доставки, вес/объём/количество мест,
+      даты, тип транспорта, особенности (хрупкий, опасный, негабарит,
+      температурный режим, страхование), контакты.
+    - Записывай каждый принятый факт инструментом mca_save_facts.
+    - Email клиента сохраняй отдельным инструментом mca_save_contact, как
+      только он продиктовал его и ты подтвердил адрес по буквам: без email
+      после звонка нельзя отправить клиенту карточку заказа.
+    - Если чего-то из обязательного не хватает — задавай один вопрос за раз,
+      сверяясь с asked_questions, чтобы не переспрашивать уже закрытое.
+    - Когда данные собраны, вызывай mca_qualify и следуй его ответу.
+
+    ЗАПРЕЩЕНО:
+    - Никогда не называй цены, тарифы, сроки доставки, характеристики техники,
+      таможенные и юридические условия — только менеджер.
+    - Не выдумывай данные компании, ИНН, груза; что клиент не подтвердил —
+    считай неизвестным.
+    - Не завершай звонок без подтверждения клиента.
+    - Не сообщай логины, ключи или внутренние детали системы.
+
+    Если клиент просит цену, условия, конкретного менеджера, обратный звонок
+    либо ты не уверен в ответе — сразу вызывай mca_transfer_to_manager с
+    причиной и приоритетом. Менеджеру передаётся вся история диалога.
+
+pipelines:
+  # Russian-first default, all three stages through the Polza gateway:
+  #   STT: openai_stt — whisper-large-v3-turbo, utterance-level REST
+  #        transcription (non-streaming; language=ru is sent per request).
+  #   LLM: openai_llm — openai/gpt-6-luna (reasoning model: max_tokens leaves
+  #        headroom so reasoning tokens never eat the visible answer).
+  #   TTS: openai_tts — google/gemini-3.8-flash-tts (wav, voice from .env).
+  mca_hybrid:
+    stt: openai_stt
+    llm: openai_llm
+    tts: openai_tts
+    options:
+      stt:
+        language: ru
+        request_timeout_sec: 20
+      llm:
+        temperature: 0.4
+        max_tokens: 1024
+      tts:
+        format:
+          encoding: ulaw
+          sample_rate: 8000
+
+profiles:
+  default: telephony_ulaw_8k
+  telephony_ulaw_8k:
+    output_resampler: linear
+    chunk_ms: auto
+    idle_cutoff_ms: 800
+    internal_rate_hz: 8000
+    provider_pref:
+      input_encoding: mulaw
+      input_sample_rate_hz: 8000
+      output_encoding: mulaw
+      output_sample_rate_hz: 8000
+    transport_out:
+      encoding: ulaw
+      sample_rate_hz: 8000
+
+# ============================================================================
+# Providers (secrets from .env)
+# ============================================================================
+providers:
+  local_stt:
+    auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
+    capabilities:
+      - stt
+    chunk_ms: ${LOCAL_WS_CHUNK_MS:=320}
+    connect_timeout_sec: ${LOCAL_WS_CONNECT_TIMEOUT:=2.0}
+    enabled: true
+    response_timeout_sec: ${LOCAL_WS_RESPONSE_TIMEOUT:=10.0}
+    stt_backend: vosk
+    # Russian telephony: point this at a Russian model, e.g.
+    # models/stt/vosk-model-ru-0.42 (download into ./models).
+    stt_model: ${LOCAL_STT_MODEL_PATH:-models/stt/vosk-model-en-us-0.22}
+    type: local
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
+
+  local_tts:
+    auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
+    capabilities:
+      - tts
+    enabled: false
+    response_timeout_sec: ${LOCAL_WS_RESPONSE_TIMEOUT:=10.0}
+    tts_voice: ${LOCAL_TTS_MODEL_PATH:-models/tts/en_US-lessac-medium.onnx}
+    type: local
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
+
+  # ---- Polza gateway (OpenAI-compatible, https://polza.ai/api/v1) ---------
+  # Component keys MUST keep the canonical openai_<role> form: AVA registers
+  # OpenAI pipeline adapters only under openai_stt/openai_llm/openai_tts
+  # (custom names like polza_llm would resolve to a placeholder and fail
+  # startup validation). Slash-containing model ids are sent as-is: they equal
+  # the provider-level defaults, which is exactly what the adapters' fallback
+  # guards resolve to. The key itself lives in .env (POLZA_API_KEY).
+  openai_stt:
+    capabilities:
+      - stt
+    api_key: ${POLZA_API_KEY:-}
+    enabled: true
+    response_timeout_sec: 20
+    stt_base_url: ${POLZA_STT_URL:-https://polza.ai/api/v1/audio/transcriptions}
+    stt_model: openai/whisper-large-v3-turbo
+    type: openai
+
+  openai_llm:
+    capabilities:
+      - llm
+    api_key: ${POLZA_API_KEY:-}
+    chat_base_url: ${POLZA_LLM_URL:-https://polza.ai/api/v1}
+    chat_model: openai/gpt-6-luna
+    enabled: true
+    # Reasoning model: budget for reasoning tokens + a short RU answer.
+    response_timeout_sec: 30
+    tools_enabled: true
+    type: openai
+
+  openai_tts:
+    capabilities:
+      - tts
+    api_key: ${POLZA_API_KEY:-}
+    enabled: true
+    response_timeout_sec: 20
+    tts_base_url: ${POLZA_TTS_URL:-https://polza.ai/api/v1/audio/speech}
+    tts_model: google/gemini-3.8-flash-tts
+    voice: ${POLZA_TTS_VOICE:-alloy}
+    type: openai
+
+  groq_llm:
+    capabilities:
+      - llm
+    api_key: ${GROQ_API_KEY:-}
+    chat_base_url: https://api.groq.com/openai/v1
+    chat_model: openai/gpt-oss-120b
+    enabled: false
+    response_timeout_sec: 10
+    temperature: 0.4
+    tools_enabled: true
+    type: openai
+
+  elevenlabs_tts:
+    type: elevenlabs
+    enabled: true
+    capabilities:
+      - tts
+    # Change voice_id to a Russian ElevenLabs voice. Documented RU examples:
+    # xC7q4vwFh1z0rFqG2Y5t (Xenia) — verify availability in your account.
+    voice_id: ${ELEVENLABS_VOICE_ID:-21m00Tcm4TlvDq8ikWAM}
+    model_id: eleven_turbo_v2_5
+    output_format: ulaw_8000
+    stability: 0.5
+    similarity_boost: 0.75
+    style: 0.0
+    use_speaker_boost: true
+
+  # Fallback full-agent route only. nova-3 handles Russian well; ultra TTS is
+  # English-only, so prefer the hybrid pipeline above for RU calls.
+  deepgram:
+    capabilities:
+      - stt
+      - llm
+      - tts
+    continuous_input: true
+    enabled: false
+    input_encoding: mulaw
+    input_sample_rate_hz: 8000
+    instructions: Voice assistant. Answer in Russian, be concise.
+    model: nova-3
+    output_encoding: mulaw
+    output_sample_rate_hz: 8000
+    tts_model: aura-2-thalia-en
+    type: full
+
+# ============================================================================
+# In-call tools — AI-invokable during the conversation. Every URL reaches the
+# MCA API (MCA_API_URL). tool mca_lead_id comes from the pre-call
+# mca_ensure_lead result, so it is always present.
+# ============================================================================
+in_call_tools:
+  mca_get_requirements:
+    kind: in_call_http_lookup
+    enabled: true
+    is_global: true
+    description: >-
+      Получить текущее состояние лида из CRM MCA: заполненные требования,
+      blocking_gaps (обязательные незаполненные поля), open_gaps и
+      asked_questions — вопросы, заданные в этом диалоге ранее, с признаком
+      answered (клиент ответил) или false (без ответа). Вызывай в начале
+      звонка (это продолжение предыдущего разговора, если лид уже существует)
+      и перед mca_save_facts, чтобы не спрашивать лишнего. Вопросы с
+      answered=true никогда не повторяй.
+    timeout_ms: 5000
+    url: "${MCA_API_URL}/api/v1/voice/leads/{mca_lead_id}/requirements"
+    method: GET
+    headers:
+      X-API-Key: "${MCA_API_KEY}"
+    return_raw_json: true
+    error_message: "Извините, мне не удалось получить данные по заявке. Попробую ещё раз."
+
+  mca_save_facts:
+    kind: in_call_http_lookup
+    enabled: true
+    is_global: true
+    description: >-
+      Сохранить подтверждённые клиентом факты по лиду в CRM MCA. Вызывай после
+      каждого блока информации, который клиент подтвердил. Не сохраняй
+      предположения и цены.
+    timeout_ms: 5000
+    url: "${MCA_API_URL}/api/v1/voice/leads/{mca_lead_id}/requirements"
+    method: PUT
+    headers:
+      X-API-Key: "${MCA_API_KEY}"
+      Content-Type: "application/json"
+    body_template: |
+      {"requirements": {facts}}
+    parameters:
+      - name: facts
+        type: string
+        description: >-
+          Строка с JSON-массивом подтверждённых фактов, например
+          [{"field":"company_name","value":"ООО Пример"}]. Поле field — одно из
+          (строго эти значения, сервер отклонит неизвестные):
+          goods_name, goods_description, goods_quantity, goods_quantity_unit,
+          goods_weight, goods_weight_unit, goods_volume, goods_volume_unit,
+          package_count, origin_country, origin_city, destination_country,
+          destination_city, transport_mode, incoterms, desired_deadline,
+          goods_value, goods_currency, needs_insurance, needs_procurement,
+          needs_foreign_supplier_payment, needs_customs_clearance,
+          needs_full_ved_support, deal_scheme_preference, company_name,
+          company_inn, contact_name, contact_position, contact_phone,
+          contact_telegram, contact_preferred_channel, additional_requirements.
+          Email клиента сюда НЕ пишется — для него есть mca_save_contact.
+          Числовые значения — цифрами (вес/объём числом, единица отдельно в
+          unit); unit — необязательно.
+        required: true
+    return_raw_json: false
+    error_message: "Не удалось сохранить данные. Проверьте состав фактов и повторите."
+
+  mca_save_contact:
+    kind: in_call_http_lookup
+    enabled: true
+    is_global: true
+    description: >-
+      Сохранить email клиента по лиду в CRM MCA. Вызывай, как только клиент
+      продиктовал адрес (обязательно уточни и подтверди адрес по буквам — он
+      нужен, чтобы после звонка отправить клиенту карточку заказа). Без валидного
+      email карточку заказа сформировать нельзя. Также можно обновить название
+      компании и ИНН, если клиент их продиктовал.
+    timeout_ms: 5000
+    url: "${MCA_API_URL}/api/v1/voice/leads/{mca_lead_id}"
+    method: PATCH
+    headers:
+      X-API-Key: "${MCA_API_KEY}"
+      Content-Type: "application/json"
+    body_template: |
+      {"contact_email": "{email}"}
+    parameters:
+      - name: email
+        type: string
+        description: >-
+          Email клиента, продиктованный и подтверждённый в разговоре,
+          например buyer@acme.test.
+        required: true
+    return_raw_json: false
+    error_message: "Не удалось сохранить email. Попросите клиента продиктовать адрес ещё раз."
+
+  mca_qualify:
+    kind: in_call_http_lookup
+    enabled: true
+    is_global: true
+    description: >-
+      Запросить у CRM MCA серверную квалификацию лида: если все обязательные
+      поля заполнены, лид становится qualified и клиенту можно предложить
+      ожидать менеджера. Вызывай после сбора данных.
+    timeout_ms: 5000
+    url: "${MCA_API_URL}/api/v1/voice/leads/{mca_lead_id}/qualify"
+    method: POST
+    headers:
+      X-API-Key: "${MCA_API_KEY}"
+      Content-Type: "application/json"
+    body_template: "{}"
+    return_raw_json: false
+    output_variables:
+      status: "status"
+      qualified: "qualified"
+    error_message: "Не удалось проверить заявку. Попробую снова."
+
+  mca_transfer_to_manager:
+    kind: in_call_http_lookup
+    enabled: true
+    is_global: true
+    description: >-
+      Передать лид менеджеру MCA: клиент просит цену/условия/конкретного
+      менеджера/обратный звонок, либо нет уверенности, либо жалоба/вопрос
+      службы безопасности. После вызова попрощайся с клиентом — заявка уходит
+      менеджеру.
+    timeout_ms: 5000
+    url: "${MCA_API_URL}/api/v1/voice/leads/{mca_lead_id}/handoff"
+    method: POST
+    headers:
+      X-API-Key: "${MCA_API_KEY}"
+      Content-Type: "application/json"
+    body_template: |
+      {
+        "reason": "{reason}",
+        "priority": "{priority}",
+        "original_request": "{original_request}",
+        "manager_key": "${MCA_MANAGER_KEY}"
+      }
+    parameters:
+      - name: reason
+        type: string
+        description: >-
+          Причина передачи: callback_requested (просит позвонить/конкретного
+          менеджера), ready_for_manager (данные собраны, нужен менеджер),
+          pricing_or_legal (цена/тариф/юруслугa), compliance_review
+          (регулируемый/санкционный груз), complaint (жалоба),
+          low_confidence (нет уверенности), security_concern (подозрительный
+          запрос), manual_request (оператор просит эскалацию).
+        required: true
+        enum:
+          - callback_requested
+          - ready_for_manager
+          - pricing_or_legal
+          - compliance_review
+          - complaint
+          - low_confidence
+          - security_concern
+          - manual_request
+      - name: priority
+        type: string
+        description: "Приоритет для менеджера: low, normal, high, critical."
+        required: true
+        enum:
+          - low
+          - normal
+          - high
+          - critical
+      - name: original_request
+        type: string
+        description: "Кратко: что именно просил клиент/суть запроса."
+        required: false
+    error_message: "Не удалось передать заявку менеджеру. Выясните у клиента контакт для обратного звонка и передайте данные позже."
+
+# ============================================================================
+# Phase tools — pre-call and post-call HTTP integrations
+# ============================================================================
+tools:
+  ai_identity:
+    name: MCA Логистика
+    number: '6000'
+
+  # Pre-call: idempotently create/fetch the lead for this caller number. The
+  # server assigns lead ids; output variables (mca_lead_id, ...) are usable in
+  # every in-call tool and in the post-call payload below.
+  mca_ensure_lead:
+    kind: generic_http_lookup
+    phase: pre_call
+    enabled: true
+    is_global: true
+    timeout_ms: 5000
+    hold_audio_file: "custom/please-wait"
+    hold_audio_threshold_ms: 500
+    url: "${MCA_API_URL}/api/v1/voice/leads"
+    method: POST
+    headers:
+      X-API-Key: "${MCA_API_KEY}"
+      Content-Type: "application/json"
+    body_template: |
+      {"caller_number": "{caller_number}"}
+    output_variables:
+      mca_lead_id: "lead_id"
+      mca_lead_status: "status"
+      mca_lead_scope: "scope"
+      mca_lead_created: "created"
+
+  # Post-call (global): persist outcome, summary and full transcript. The
+  # transcript roles (user/assistant) are mapped server-side; service lines
+  # are skipped. Idempotency key comes from the call id.
+  mca_finish_call:
+    kind: generic_webhook
+    phase: post_call
+    enabled: true
+    is_global: true
+    generate_summary: true
+    # Route the summary through the configured openai_llm component (Polza
+    # openai/gpt-6-luna). Without summary_provider AVA falls back to a legacy
+    # path that needs OPENAI_API_KEY and hardcodes gpt-4o-mini.
+    summary_provider: openai_llm
+    summary_max_words: 100
+    summary_timeout_ms: 30000
+    summary_prompt: >-
+      Опиши итог телефонного разговора CRM-записи на русском в {max_words} слов:
+      суть запроса, собранные данные о перевозке, результат.
+    timeout_ms: 8000
+    url: "${MCA_API_URL}/api/v1/voice/calls/finish"
+    method: POST
+    headers:
+      X-API-Key: "${MCA_API_KEY}"
+      Content-Type: "application/json"
+    payload_template: |
+      {
+        "lead_id": "{mca_lead_id}",
+        "caller_number": "{caller_number}",
+        "call_id": "{call_id}",
+        "outcome": "{call_outcome}",
+        "summary": "{summary}",
+        "transcript": {transcript_json}
+      }
+
+  # ---- built-in tool configuration (AVA defaults, tuned for MCA) -----------
+  enabled: true
+  default_action_timeout: 30
+  cancel_transfer:
+    allow_during_ring: true
+    enabled: false
+  check_extension_status:
+    restrict_to_configured_extensions: true
+  extensions:
+    internal:
+      '6000':
+        action_type: transfer
+        device_state_tech: auto
+        aliases:
+          - mca_manager
+          - manager
+          - менеджер
+          - оператор
+          - менеджер организации
+          - консультант
+        description: Менеджер MCA (логистика)
+        dial_string: SIP/6000
+        mode: warm
+        name: Менеджер MCA
+        timeout: 30
+        transfer: true
+  hangup_call:
+    enabled: true
+    farewell_message: Спасибо за обращение в MCA! До свидания.
+    require_confirmation: false
+    policy:
+      mode: normal
+      enforce_transcript_offer: false
+      block_during_contact_capture: true
+      markers:
+        end_call:
+          - нет, спасибо
+          - не надо
+          - ничего больше
+          - на этом всё
+          - завершаем
+          - это все
+          - всё
+          - до свидания
+          - пока
+        assistant_farewell:
+          - до свидания
+          - спасибо за обращение
+          - всего доброго
+          - хорошего дня
+        affirmative:
+          - да
+          - да, верно
+          - правильно
+          - точно
+          - подтверждаю
+        negative:
+          - нет
+          - не
+          - не нужно
+          - не надо
+  leave_voicemail:
+    enabled: false
+  request_transcript:
+    enabled: true
+    admin_email: ${ADMIN_EMAIL:-}
+    api_key: ${RESEND_API_KEY:-}
+    from_email: ${MCA_FROM_EMAIL:-noreply@mca.example.com}
+    from_name: ${MCA_FROM_NAME:-MCA Логистика}
+    common_domains:
+      - gmail.com
+      - yandex.ru
+      - mail.ru
+      - outlook.com
+    confirm_email: true
+    max_attempts: 2
+    provider: ${REQUEST_TRANSCRIPT_PROVIDER:-resend}
+    validate_domain: false
+  send_email_summary:
+    admin_email: ${ADMIN_EMAIL:-}
+    api_key: ${RESEND_API_KEY:-}
+    enabled: false
+    from_email: ${MCA_FROM_EMAIL:-noreply@mca.example.com}
+    from_name: ${MCA_FROM_NAME:-MCA Логистика}
+    include_metadata: true
+    include_transcript: true
+    provider: ${SEND_EMAIL_PROVIDER:-resend}
+  transfer:
+    defer_until_playback_complete: true
+    deferred_strategy: drain_then_dial
+    deferred_audio_drain_timeout_sec: 15
+    deferred_audio_drain_quiet_ms: 500
+    predial_bridge_wait_timeout_sec: 10

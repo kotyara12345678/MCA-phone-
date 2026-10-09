@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package mca.voice.v1;
+
+import "mca/ai/v1/ai.proto";
+
+// Telephony-independent control plane for the realtime voice layer.
+// An Asterisk/ARI adapter will drive exactly this surface later.
+
+enum CallStatus {
+  CALL_STATUS_UNSPECIFIED = 0;
+  CALL_STATUS_RINGING = 1;
+  CALL_STATUS_IN_PROGRESS = 2;
+  CALL_STATUS_FINISHED = 3;
+  CALL_STATUS_FAILED = 4;
+}
+
+enum AudioFormat {
+  AUDIO_FORMAT_UNSPECIFIED = 0;
+  AUDIO_FORMAT_PCM_S16LE = 1;
+  AUDIO_FORMAT_PCM_S16BE = 2;
+  AUDIO_FORMAT_ULAW = 3;
+  AUDIO_FORMAT_ALAW = 4;
+  AUDIO_FORMAT_OPUS = 5;
+}
+
+message Call {
+  string call_id = 1;
+  string session_id = 2;
+  string external_call_id = 3;
+  string from_number = 4;
+  string to_number = 5;
+  CallStatus status = 6;
+  mca.ai.v1.DialogueStage stage = 7;
+  int64 started_at_unix_ms = 8;
+  int64 ended_at_unix_ms = 9;
+  int64 turn_count = 10;
+  bool speaking = 11;
+  string last_transcript = 12;
+  string last_reply = 13;
+}
+
+message OpenCallRequest {
+  string external_call_id = 1;
+  string from_number = 2;
+  string to_number = 3;
+  string language = 4;
+  string correlation_id = 5;
+}
+
+message OpenCallResponse {
+  Call call = 1;
+  string greeting_audio_base64 = 2;
+  string greeting_text = 3;
+}
+
+message AudioChunk {
+  string call_id = 1;
+  bytes audio = 2;
+  AudioFormat format = 3;
+  int32 sample_rate = 4;
+  int32 channels = 5;
+  int64 seq = 6;
+  int64 sent_at_unix_ms = 7;
+  bool end_of_utterance = 8;
+}
+
+message VoiceEvent {
+  string call_id = 1;
+  int64 seq = 2;
+  string kind = 3;
+  int64 at_unix_ms = 4;
+  string text = 5;
+  mca.ai.v1.DialogueStage stage = 6;
+  bytes audio = 7;
+  AudioFormat audio_format = 8;
+  bool end_of_utterance = 9;
+  bool interrupted = 10;
+  int64 latency_ms = 11;
+}
+
+message HangupRequest {
+  string call_id = 1;
+  string reason = 2;
+  string correlation_id = 3;
+}
+
+message HangupResponse {
+  Call call = 1;
+  string application_id = 2;
+  mca.ai.v1.Qualification qualification = 3;
+}
+
+message GetCallRequest {
+  string call_id = 1;
+}
+
+message GetCallResponse {
+  Call call = 1;
+}
+
+message ListCallsRequest {}
+
+message ListCallsResponse {
+  repeated Call calls = 1;
+}
+
+service VoiceService {
+  rpc OpenCall(OpenCallRequest) returns (OpenCallResponse);
+  rpc PushAudio(AudioChunk) returns (VoiceEvent);
+  rpc StreamAudio(stream AudioChunk) returns (stream VoiceEvent);
+  rpc Hangup(HangupRequest) returns (HangupResponse);
+  rpc GetCall(GetCallRequest) returns (GetCallResponse);
+  rpc ListCalls(ListCallsRequest) returns (ListCallsResponse);
+}

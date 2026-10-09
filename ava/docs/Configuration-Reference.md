@@ -1,0 +1,996 @@
+# Configuration Reference
+
+This document explains every major option in `config/ai-agent.yaml`, the precedence model for greeting/persona, and the impact of fine‑tuning parameters across AudioSocket/ExternalMedia, VAD, Barge‑In, Streaming, and Providers.
+
+## Local Override File (`ai-agent.local.yaml`)
+
+Operator customizations are stored in `config/ai-agent.local.yaml` (git-ignored). At startup the engine deep-merges this file on top of the base `config/ai-agent.yaml`:
+
+- **Base file** (`config/ai-agent.yaml`) — shipped golden defaults, git-tracked. Updated by upstream releases.
+- **Local override** (`config/ai-agent.local.yaml`) — operator changes only. All Admin UI saves, CLI wizard writes, and `agent setup` output go here.
+
+Keys in the local file win over the base file (deep merge — nested dicts are merged recursively, scalars are replaced). If the local file does not exist, the base file is used as-is.
+
+This separation means `git pull` during updates will never conflict with operator config, eliminating the merge-conflict problem on `ai-agent.yaml`.
+
+### ARI WebSocket silent-failure detection
+
+The engine uses protocol-level WebSocket pings to detect an ARI connection that
+has stopped carrying packets without a clean TCP close:
+
+```yaml
+asterisk:
+  ws_ping_interval_sec: 10
+  ws_ping_timeout_sec: 10
+```
+
+The nominal detection bound is the interval plus the timeout, so the shipped
+defaults make `/ready` fail in approximately 20 seconds before the existing
+reconnect supervisor takes over. Both values accept 5–60 seconds and require an
+AI Engine restart. Values near the lower bound should be used only after load
+testing because a severely stalled event loop can delay pong processing and
+cause an unnecessary reconnect.
+
+## Configuration Architecture
+
+Starting in v4.0, the project added a **modular pipeline architecture** alongside monolithic provider support:
+
+### Monolithic Providers
+- **Single provider** handles STT, LLM, and TTS internally
+- Examples: `openai_realtime`, `deepgram` Voice Agent
+- Configuration: Set `default_provider: "openai_realtime"` or `default_provider: "deepgram"`
+- **Best for**: Simplicity, fastest response times
+
+### Pipeline Configurations
+- **Separate providers** for STT, LLM, and TTS
+- Examples: Local Hybrid (Vosk STT + OpenAI LLM + Piper TTS)
+- Configuration: Define under `pipelines:` block and set `active_pipeline: "pipeline_name"`
+- **Best for**: Flexibility, privacy (local audio processing), cost control
+
+### Pipeline LLM Hangup Guardrail (hangup_call)
+
+Some pipeline LLMs can be overly eager to emit `hangup_call`. A per-pipeline guardrail can require explicit end-of-call intent in the user's transcript before honoring `hangup_call`.
+
+- `pipelines.<name>.options.llm.hangup_call_guardrail`: `true`/`false` (unset = auto; enabled by default for specific adapters)
+- `pipelines.<name>.options.llm.hangup_call_guardrail_mode`: `relaxed`/`normal`/`strict` (unset = use global hangup policy mode)
+- `pipelines.<name>.options.llm.hangup_call_guardrail_markers.end_call`: list of caller phrases that count as end-of-call intent (unset/empty = use global hangup policy defaults)
+
+Streaming modular STT uses an engine-managed raw PCM16-LE mono 16 kHz bus.
+`stream_format`, `encoding`, `sample_rate`, and `channels` are written by the
+Admin UI for clarity but are not independently negotiable. Conflicting legacy
+values are normalized at runtime and logged. Audio Profiles continue to control
+wire/full-agent negotiation and do not change the modular STT bus format.
+
+### Golden Baselines
+See the validated configurations in `config/`:
+- `ai-agent.golden-openai.yaml` - OpenAI Realtime (monolithic, fastest)
+- `ai-agent.golden-deepgram.yaml` - Deepgram Voice Agent (monolithic, enterprise)
+- `ai-agent.golden-google-live.yaml` - Google Live (monolithic, lowest latency)
+- `ai-agent.golden-elevenlabs.yaml` - ElevenLabs Agent (monolithic, premium voice)
+- `ai-agent.golden-local-hybrid.yaml` - Local Hybrid (pipeline, privacy-focused)
+
+### Additional Pipeline Providers (v6.4.0+)
+- **Azure Speech Service** — Modular STT (`azure_stt`) and TTS (`azure_tts`) pipeline adapters. See [Provider-Azure-Setup.md](Provider-Azure-Setup.md).
+- **MiniMax LLM** — Pipeline LLM adapter (`minimax_llm`). See [Provider-MiniMax-Setup.md](Provider-MiniMax-Setup.md).
+- **Telnyx AI Inference** — Pipeline LLM adapter. See [Provider-Telnyx-Setup.md](Provider-Telnyx-Setup.md).
+
+For comprehensive inline documentation, refer to the golden baseline YAML files directly.
+
+### Local AI Server Backends (v4.4.2+)
+
+Environment variables for selecting local STT/TTS backends:
+
+| Variable | Options | Default | Description |
+|----------|---------|---------|-------------|
+| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `tone`, `faster_whisper`, `whisper_cpp` | `vosk` | Speech-to-text engine |
+| `LOCAL_TTS_BACKEND` | `piper`, `kokoro`, `melotts`, `silero` | `piper` | Text-to-speech engine |
+
+**STT Backends**:
+- **Vosk**: Offline ASR with good accuracy, multiple language models
+- **Sherpa-ONNX**: Low-latency streaming ASR using ONNX runtime
+- **Kroko**: High-quality streaming ASR with 12+ languages (requires API key for hosted mode)
+- **T-one**: Native Russian telephony STT using the upstream streaming CTC pipeline
+- **Faster-Whisper**: Whisper inference via `faster-whisper` (model IDs like `base`, `small`, etc., or a local model directory depending on your install)
+- **Whisper.cpp**: Local GGML Whisper inference with multilingual language hints
+
+**TTS Backends**:
+- **Piper**: Fast local TTS with multiple voices
+- **Kokoro**: High-quality neural TTS with natural prosody (voices: af_heart, af_bella, am_michael)
+- **MeloTTS**: High-quality multilingual TTS with voice IDs (depends on installed voices/models)
+
+**Model/voice identifiers**:
+- `providers.local.stt_model` and `providers.local.tts_voice` are treated as **backend-specific identifiers** (paths for some backends, IDs for others) and are used by the Admin UI “switch/rebuild” flows.
+
+See [LOCAL_ONLY_SETUP.md](LOCAL_ONLY_SETUP.md) for detailed configuration.
+
+---
+
+## Call Selection & Precedence (Provider / Pipeline / Agent)
+
+On each call, the engine selects:
+- an **agent** (greeting/prompt/tools/profile)
+- a **provider mode** (full agent provider vs pipeline)
+
+This selection is intentionally flexible so you can keep safe defaults while still overriding behavior per extension.
+
+### Agent selection
+
+> **v7.4 resolution is Agent-only.** After the one-time YAML → `agents.db`
+> migration (see [OPERATOR_MIGRATION.md](OPERATOR_MIGRATION.md)), the engine resolves
+> the agent for a call from `agents.db`, **not** from `ai-agent.yaml` at runtime. Editing
+> a context directly in `ai-agent.yaml` or `config/contexts/*.yaml` after migration has
+> **no runtime effect** — it only triggers a drift warning. Edit agents in
+> **Admin UI → Agents**, or reconcile YAML changes via **Agents → Migration Status**.
+
+Resolution order on each call:
+
+1. `AI_AGENT` channel var (preferred) → agent looked up by slug in `agents.db`.
+2. `AI_CONTEXT` channel var (deprecated compatibility alias) → agent looked up display-name-first.
+3. Otherwise, the default agent in `agents.db`.
+
+`AI_AGENT` wins if both `AI_AGENT` and `AI_CONTEXT` are set on the channel.
+
+Before accepting calls, v7.4 atomically imports legacy YAML Contexts when `agents.db` is
+empty. Runtime routing then reads Agents only and fails closed if the database is absent
+or unreadable. There is no live YAML persona fallback in v7.4.
+
+### Audio profile selection
+
+Audio profiles control the call’s negotiated sample rates/encodings (telephony wire format, provider input/output format, and internal pacing). They are defined under `profiles:` in `config/ai-agent.yaml`.
+
+The shipped `telephony_ulaw_8k` profile retains compatibility downsampling.
+`telephony_enhanced_8k` is an opt-in profile with the same stable 8 kHz wire
+contract plus alias-safe provider-output downsampling. It reduces sibilant hiss
+when a provider emits 16 or 24 kHz PCM; native 8 kHz output is unchanged. To
+roll back a test, assign the Agent back to `telephony_ulaw_8k`.
+
+`wideband_pcm_16k` is the opt-in end-to-end wideband profile for AudioSocket.
+It originates the media channel as `c(slin16)`, receives PCM16 at 16 kHz in
+AudioSocket type `0x12`, and stamps outbound frames with the same type. This is
+per call, so 8 and 16 kHz Agents can run concurrently. Full-agent providers use
+their declared native PCM boundary (16 or 24 kHz), and supported modular TTS
+adapters request PCM and convert once to the 16 kHz AudioSocket boundary. It
+requires Asterisk 20.17+, 21.12+, 22.7+, or 23.1+ and a wideband caller leg
+(for example G.722). Older or unrecognized Asterisk versions fail the call
+closed with a remediation message. Use
+`telephony_ulaw_8k` or `telephony_enhanced_8k` for PSTN/G.711 calls;
+upsampling an 8 kHz trunk cannot restore frequencies that the trunk discarded.
+
+ExternalMedia RTP supports the shipped `telephony_ulaw_8k` and
+`telephony_enhanced_8k` profiles only. Do not assign `wideband_pcm_16k` while
+`audio_transport: externalmedia` is active. RTP ExternalMedia has no SDP offer
+and therefore cannot negotiate the dynamic payload mapping used by Asterisk for
+`slin16`; returning payload type 118 produced no caller audio in live testing.
+Asterisk Media WebSocket can carry `slin16` as well as `ulaw`, `alaw`, and
+`slin` in AAVA's opt-in WebSocket transport. That transport has its own
+qualification and network requirements; see [WebSocket Transport](WebSocket-Transport.md).
+
+The wideband provider boundary is call-scoped and does not rewrite provider
+defaults. OpenAI Realtime uses PCM at 24 kHz in both directions; Google Live
+uses 16 kHz input and fixed 24 kHz output; ElevenLabs, Deepgram, and Grok use
+their declared 16 kHz PCM route. Their output is converted to the 16 kHz wire
+rate where necessary. Local TTS negotiates native `linear16@16000` output for
+Piper and Kokoro (local or API mode); MeloTTS, Matcha, and Silero retain a
+truthful μ-law/8 kHz fallback. The Local Hybrid Piper path is live-validated;
+the local Kokoro CPU canary preserved correct 16 kHz media but failed the
+interactive-latency gate because whole-utterance synthesis was approximately
+real-time or slower. Kokoro API mode and the local full-agent path remain
+untested. Use Piper for CPU deployments unless local Kokoro performance has
+been measured on the target host. Switching the Agent back to an 8 kHz profile
+is an immediate per-call rollback.
+
+The profile field is `output_resampler: linear | bandlimited`. Provider and
+pipeline fields default to `inherit`. Narrow overrides resolve in this order:
+full-agent environment override, pipeline override, provider override, audio
+profile, then the compatibility default. Existing profiles without this field
+continue to use `linear`.
+
+Highest priority first:
+
+1. **Dialplan override**: `AI_AUDIO_PROFILE` (if set)
+2. **Agent mapping**: the selected Agent's `audio_profile` value in `agents.db`
+3. **Global default**: `profiles.default` (fallback is `telephony_ulaw_8k` if unset)
+
+### Provider selection
+
+Highest priority first:
+
+1. **Dialplan override**: `AI_PROVIDER` (if set)
+2. **Agent override**: the selected Agent's provider or pipeline in `agents.db`
+3. **Global default**: `default_provider`
+
+### Pipeline selection
+
+If the selected provider path is a pipeline-based configuration, the engine uses:
+
+- `active_pipeline` to determine which pipeline to run.
+- If `active_pipeline` is unset/null, the engine falls back to the first available pipeline in `pipelines:`.
+
+### Recommended approach
+
+- Keep `default_provider` + `active_pipeline` set to a known-good baseline.
+- Use `AI_AGENT` (preferred; `AI_CONTEXT` is the legacy equivalent) for persona/tool scoping.
+- Use `AI_PROVIDER` only when you want an explicit per-extension override.
+
+See also:
+- [Installation Guide](INSTALLATION.md)
+- [Transport Compatibility](Transport-Mode-Compatibility.md)
+
+---
+
+## Provider-start failure recovery
+
+Provider and explicit pipeline startup failures use these root-level settings:
+
+| Key | Default | Description |
+|---|---|---|
+| `on_provider_failure` | `announce_hangup` | `announce_hangup`, opt-in `dialplan_redirect`, or legacy `leave_open` |
+| `provider_failure_prompt` | `sorry-youre-having-problems` | Asterisk sound played before the safe fallback hangup |
+| `provider_failure_redirect_context` | unset | Required Asterisk context for `dialplan_redirect` |
+| `provider_failure_redirect_extension` | `s` | Extension within the recovery context |
+| `provider_failure_redirect_priority` | `1` | Priority within the recovery extension |
+
+`dialplan_redirect` marks the caller as transferred before issuing ARI
+`continueInDialplan`, so Stasis cleanup removes AAVA's bridge/media channels but
+does not hang up the caller. The continuation is attempted once. A missing
+context, ARI error, or rejected continuation falls back to the configured error
+prompt and hangup; it never leaves the caller in silent dead air.
+
+Example:
+
+```yaml
+on_provider_failure: dialplan_redirect
+provider_failure_redirect_context: aava-provider-failure
+provider_failure_redirect_extension: s
+provider_failure_redirect_priority: 1
+```
+
+```asterisk
+[aava-provider-failure]
+exten => s,1,NoOp(AAVA provider startup failed)
+ same => n,Playback(sorry-youre-having-problems)
+ same => n,Goto(from-internal,6000,1)
+```
+
+The recovery route must not send the same channel directly back to the failing
+AAVA agent, or the dialplan can create a retry loop.
+
+---
+
+## Outbound Campaign Dialer (Milestone 22)
+
+Outbound calling is implemented as an **engine-driven scheduler + SQLite + ARI originate**, with **dialplan-assisted AMD** for voicemail detection.
+
+### Assumptions (MVP)
+
+- Your outbound **trunk(s) and outbound routes** are already configured in Asterisk/FreePBX.
+- Outbound calls originate as **extension identity `6789`** (default), and routing happens via your existing FreePBX dialplan patterns.
+- Campaign defaults and lead overrides should contain active Agent slugs; outbound channels set canonical `AI_AGENT` and retain `AI_CONTEXT` only as a v7.4 compatibility alias.
+- Persistence reuses the existing Call History SQLite DB path (`CALL_HISTORY_DB_PATH`) by adding outbound tables.
+
+### Key env vars
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AAVA_OUTBOUND_EXTENSION_IDENTITY` | `6789` | Extension identity for FreePBX routing (sets `AMPUSER` + `CALLERID(num)` on originate) |
+| `AAVA_OUTBOUND_AMD_CONTEXT` | `aava-outbound-amd` | Dialplan context name used for AMD hop (`continueInDialplan`) |
+| `AAVA_OUTBOUND_PBX_TYPE` | `freepbx` | PBX-specific AAVA Campaign channel vars: `freepbx` \| `generic`. Legacy `vicidial` remains readable for one migration release but cannot be newly selected in the UI; use Call Scheduling → VICIdial Remote Agents. |
+| `AAVA_OUTBOUND_DIAL_CONTEXT` | `from-internal` | Asterisk dialplan context for `Local/` channel origination |
+| `AAVA_OUTBOUND_DIAL_PREFIX` | (empty) | Dial prefix prepended to phone number for AAVA Campaign carrier selection |
+| `AAVA_OUTBOUND_CHANNEL_TECH` | `auto` | Channel tech for extension probing: `auto` \| `pjsip` \| `sip` \| `local_only` |
+| `AAVA_OUTBOUND_ATTEMPT_STALE_SECONDS` | `120` | Shared startup/runtime timeout for attempts that never reach a live session; minimum `10` seconds |
+| `AAVA_OUTBOUND_LEAD_IMPORT_MAX_BYTES` | `10485760` | Maximum uploaded CSV or `.xlsx` lead file size in bytes |
+| `AAVA_OUTBOUND_LEAD_IMPORT_MAX_ROWS` | `10000` | Maximum data rows read from the first `.xlsx` worksheet; hard-capped at `100000` |
+| `AAVA_MEDIA_DIR` | `/mnt/asterisk_media/ai-generated` | Where the Admin UI uploads voicemail drop `.ulaw` files |
+
+### Dialplan requirements
+
+- Create a custom dialplan context (default: `[aava-outbound-amd]`) that runs `AMD(${AAVA_AMD_OPTS})` and returns to Stasis with:
+  - `outbound_amd` (action)
+  - `${AAVA_ATTEMPT_ID}` (attempt correlation)
+  - `${AMDSTATUS}` and `${AMDCAUSE}`
+
+See `docs/contributing/milestones/milestone-22-outbound-campaign-dialer.md` for the full snippet and smoke test checklist.
+
+### Originate-time channel variables and lead context
+
+AAVA sends outbound channel variables in the ARI `POST /channels` JSON
+`variables` object. This includes Agent/provider routing, outbound correlation,
+FreePBX identity, AMD/consent controls, and the internal
+`AAVA_CUSTOM_VARS_JSON` lead-context value. Local-channel routes receive both
+ordinary and inherited variants so the metadata survives the `;1`/`;2`
+boundary.
+
+Lead `custom_vars` must serialize to at most 8,192 bytes. Nonempty context is
+reapplied and read back before the answered channel enters the AMD dialplan
+hop. A missing or mismatched value fails the attempt closed before provider
+startup. If the engine restarts while an originate is still ringing, it
+recovers the unfinished attempt and lead from SQLite before applying the same
+gate; unavailable authoritative metadata also fails closed. The value is
+intentionally excluded from logs; use attempt, campaign, lead, and channel
+identifiers when troubleshooting.
+
+## VICIdial Remote Agents (Alpha)
+
+VICIdial Remote Agents are separate from AAVA's native Outbound Campaign Dialer. VICIdial owns
+campaign origination, customer channels, reports, dispositions, DNC, callbacks, and transfers;
+AAVA supplies the mapped AI conversation. Configure connections and mappings under
+**Call Scheduling → VICIdial Remote Agents** and follow the
+[VICIdial Remote Agent Setup](Vicidial-Setup.md) acceptance sequence.
+
+The connection stores environment-variable names rather than credential values. The UI defaults
+to the following names, but a mapping may reference other valid environment-variable names:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VICIDIAL_API_USER` | (empty) | Dedicated least-privilege VICIdial API username referenced by the connection |
+| `VICIDIAL_API_PASS` | (empty) | Dedicated VICIdial API password referenced by the connection |
+| `VICIDIAL_DB_PATH` | `/app/data/operator/vicidial.db` | Shared SQLite store for connections, mappings, and readiness evidence |
+
+Recreate `ai_engine` and `admin_ui` after changing credential environment variables so both
+services receive the same values. Back up `vicidial.db` with the rest of `data/operator/`; it
+contains configuration and verification evidence, but never the referenced API password.
+
+## Canonical persona and greeting
+
+- llm.initial_greeting: Text the agent speaks first (if provider supports explicit greeting or the engine plays via TTS).
+- llm.prompt: The agent persona/instructions used by LLMs.
+- Precedence at runtime:
+  1) Provider/pipeline overrides (if explicitly set, e.g., `providers.openai_realtime.instructions`, `providers.deepgram.greeting`)
+  2) `llm.prompt` and `llm.initial_greeting` in YAML
+  3) Env defaults `AI_ROLE`, `GREETING`
+
+## Voice (v7.3.0+)
+
+- Voice precedence per call: per-call override → agent voice (agents.db, or the optional
+  `voice:` key on a YAML context) → the provider's configured voice (default/fallback).
+- Supported for per-agent override: OpenAI Realtime (validated against the GA voice list —
+  unknown values fall back with a warning, never failing the call), Grok, Google Live, and
+  Deepgram Voice Agent. ElevenLabs Agent voices are platform-managed; pipeline TTS voices
+  come from the pipeline's TTS provider configuration.
+- The resolved voice and its source are logged (`Session voice resolved`) and recorded in
+  Call History per call. See [VOICE_SELECTION.md](VOICE_SELECTION.md).
+
+## Transports
+
+- audio_transport: `audiosocket` | `externalmedia` | `websocket`
+  - **audiosocket**: TCP-based audio transport.
+  - **externalmedia**: RTP/UDP-based audio transport.
+  - **websocket**: Opt-in Asterisk Media WebSocket transport. AAVA creates the
+    media leg through ARI; calls still enter the normal Stasis
+    dialplan. Requires Asterisk 20.18+, 22.8+, or 23.2+ on those branches,
+    authenticated Asterisk-outbound media connections, and per-combination
+    qualification. It supports `ulaw`, `alaw`, `slin`, and `slin16`; it does
+    not automatically fall back mid-call to AudioSocket or RTP. See
+    [WebSocket setup and qualification](WebSocket-Transport.md).
+    `websocket_media.control_format` defaults to `json`; experimental `auto`
+    selects plain on exactly 20.17.0 or JSON on the listed floors. Explicit
+    `plain` is restricted to 20.17.0. Unknown versions fail closed. Both modes
+    require per-provider live qualification and a restart/recreate to apply.
+  - **Selection**: Use the validated combinations in **[Transport & Playback Mode Compatibility Guide](Transport-Mode-Compatibility.md)**. Transport selection depends on provider mode and playback method (not a single strict rule).
+- downstream_mode: `stream` | `file`
+  - **stream**: Real-time streaming (20ms frames). Best UX. Works with full agents.
+  - **file**: File-based playback via bridge. Most robust for pipelines; streaming-first is supported with automatic fallback to file when enabled.
+
+## AudioSocket
+
+- audiosocket.host: Bind address for AudioSocket listener.
+- audiosocket.advertise_host: Address Asterisk connects to (optional; defaults to `audiosocket.host`). Use for NAT/VPN.
+- audiosocket.port: TCP port.
+- audiosocket.format: fallback wire format for legacy/companded profiles. Shipped YAML uses `slin` (16-bit signed linear @ 8 kHz), the validated compatibility default. Signed-linear Audio Profiles override this per call: `wideband_pcm_16k` selects `slin16` without changing the global value. Keep the fallback at `slin`; select wideband on the Agent or with `AI_AUDIO_PROFILE` rather than changing it globally.
+
+## ExternalMedia
+
+- external_media.rtp_host: Bind address for RTP server.
+- external_media.advertise_host: Address Asterisk sends RTP to (optional; defaults to `external_media.rtp_host`). Use for NAT/VPN.
+- external_media.rtp_port: Port for inbound RTP.
+- external_media.port_range: Optional range (`start:end`) for dynamic per-call RTP allocation; defaults to `rtp_port`.
+- external_media.codec: Asterisk RTP wire codec. The supported release baseline is `ulaw` at 8 kHz with `telephony_ulaw_8k` or `telephony_enhanced_8k`. `slin16`/16 kHz RTP is not supported; use AudioSocket with `wideband_pcm_16k` instead.
+- external_media.direction: `both` | `sendonly` | `recvonly`.
+- external_media.lock_remote_endpoint: When true (default), **do not** accept mid-call changes to the inbound RTP source `(ip,port)` for that call.
+- external_media.allowed_remote_hosts: Optional list of **IP addresses** allowed as inbound RTP sources. When set, packets from other sources are dropped (recommended when the RTP source IP is stable).
+  - Note: if `asterisk.host` is an IP literal, the engine may default `allowed_remote_hosts` to `[asterisk.host]` unless explicitly configured.
+  - If `asterisk.host` is a **hostname**, set `external_media.allowed_remote_hosts` explicitly (the platform does not auto-allowlist hostnames).
+- Note: `external_media.jitter_buffer_ms` is no longer used (RTP buffering is not configurable here). Use `streaming.jitter_buffer_ms` for downstream playback pacing.
+
+## WebSocket Media
+
+Applies when `audio_transport: websocket` (opt-in; see [WebSocket Transport](WebSocket-Transport.md) for version floors, the matching Asterisk `websocket_client.conf` stanza, and qualification). The block is strictly validated: unknown keys are rejected even while another transport is selected.
+
+- websocket_media.connection_mode: `asterisk_outbound` (only value; Asterisk opens the per-call connection to the engine listener).
+- websocket_media.connection_name: Name of the Asterisk `websocket_client.conf` section (default `aava_media`; letters, digits, `_`, `-`).
+- websocket_media.bind_host: Listener bind address (default `127.0.0.1`).
+- websocket_media.advertise_host: Address Asterisk connects to (default `127.0.0.1`). Use for routed/NAT topologies.
+- websocket_media.port: Listener TCP port (default `8787`; 1024–65535).
+- websocket_media.path: Absolute WebSocket path without query or fragment (default `/media`).
+- websocket_media.format_policy: `profile` (only value; the frozen per-call audio profile selects the wire format).
+- websocket_media.fallback_format: `ulaw` | `alaw` | `slin` | `slin16` (default `ulaw`); used when the profile does not pin a wire format.
+- websocket_media.control_format: `json` | `auto` | `plain` (default `json`). Explicit `plain` is experimental and limited to Asterisk 20.17.0. `auto` opts into plain on exactly 20.17.0 and selects JSON on 20.18+, 22.8+, or 23.2+; unsupported release lines fail closed. See the Transports section above.
+- websocket_media.direction: `both` (only value).
+- websocket_media.handshake_timeout_ms: WebSocket open/close handshake timeout (default `5000`; 100–60000).
+- websocket_media.media_start_timeout_ms: Max wait for the per-call connection to become ready (`MEDIA_START`) before the call fails (default `5000`; 100–60000).
+- websocket_media.drain_timeout_ms: Max wait for queued playback to drain (e.g. farewell audio) before hangup proceeds (default `30000`; 1000–120000).
+- websocket_media.pre_start_buffer_ms: Amount of inbound media (in ms) buffered when Asterisk sends audio before `MEDIA_START`; `0` rejects such frames (default `200`; 0–5000).
+- websocket_media.max_connections: Listener connection cap; further connections are refused (default `100`; 1–10000).
+- websocket_media.allowed_remote_hosts: Allowed Asterisk source addresses (default `["127.0.0.1"]`). IP literals or `localhost` only — no CIDR ranges or DNS names; at least one entry is required.
+- websocket_media.auth.required: Require authentication (default `true`). Must be `true` whenever `bind_host` or `advertise_host` is not loopback. Disabling it on loopback is an explicit trusted-local-process opt-out: a nonce protects call binding, not listener admission, and untrusted local processes can exhaust connection slots. Keep authentication enabled unless all local processes are trusted.
+- websocket_media.auth.username: Username Asterisk presents (default `aava_media`).
+- websocket_media.auth.password_env: Name of the AI Engine env var holding the media password (default `ASTERISK_MEDIA_WS_PASSWORD`). YAML never holds the value: set `ASTERISK_MEDIA_WS_PASSWORD` in `.env`, keep it equal to the `password` in the Asterisk client stanza, and recreate the engine container after changing it.
+- websocket_media.tls.enabled: Serve WSS (default `false`).
+- websocket_media.tls.cert_file / websocket_media.tls.key_file: Certificate and key paths readable by the AI Engine. Both are required when `tls.enabled` is `true` and rejected when it is `false`.
+
+## Barge‑In
+
+Controls interruption of TTS playback when the caller speaks.
+
+- barge_in.enabled: true/false
+- barge_in.initial_protection_ms: 200–600 ms. Drop inbound immediately after TTS starts to avoid self‑echo.
+- barge_in.min_ms: 250–600 ms. Minimum sustained speech before a barge‑in is acknowledged (de‑bounce).
+- barge_in.energy_threshold: 1000–3000. RMS energy threshold; raise on noisy lines.
+- barge_in.cooldown_ms: 500–1500 ms. Ignore new barge‑ins after one triggers.
+- barge_in.post_tts_end_protection_ms: 250–500 ms. Short guard to avoid clipping the start of the next caller utterance.
+- barge_in.pipeline_min_ms: 80–250 ms. Pipeline-only (local file playback) minimum talk duration before triggering barge-in.
+- barge_in.pipeline_energy_threshold: 200–1200. Pipeline-only RMS threshold (more sensitive than full-agent mode).
+- barge_in.pipeline_talk_detect_enabled: true/false. Pipeline-only; uses Asterisk `TALK_DETECT` (ARI `ChannelTalkingStarted`) to trigger barge-in during channel playback.
+- barge_in.pipeline_talk_detect_silence_ms: 800–2000. Pipeline-only; `TALK_DETECT(set)` silence window.
+- barge_in.pipeline_talk_detect_talking_threshold: 1–32768 (default 256). Pipeline-only; global Asterisk `TALK_DETECT(set)` DSP magnitude threshold. Audio profiles can override it with `profiles.<name>.talk_detect_talking_threshold`; `wideband_pcm_16k` uses the live-validated value 1000 to reject wideband playback echo while retaining caller barge-in.
+
+Notes (pipelines / `local_hybrid`):
+
+- Pipelines play TTS locally (file playback), so the platform can flush playback on barge-in without colliding with provider-owned VAD/cancellation.
+- With ExternalMedia, Asterisk channel playback may pause/alter the inbound RTP stream; `TALK_DETECT` is the preferred trigger source for pipeline barge-in.
+- Prereqs: Asterisk must have talk detection available (`app_talkdetect.so` / `func_talkdetect.so`). Verify with `asterisk -rx 'module show like talkdetect'` and `asterisk -rx 'core show function TALK_DETECT'`.
+
+Notes (OpenAI Realtime / AudioSocket):
+
+- OpenAI can emit `input_audio_buffer.speech_started` when the provider has no cancellable response but the platform is still draining buffered audio; the platform treats this as a barge-in trigger to flush local output immediately.
+
+Tuning guidance:
+
+- Noisy lines: raise `energy_threshold` and `min_ms`.
+- Fast, chatty interactions: lower `min_ms` and `post_tts_end_protection_ms` cautiously.
+
+## Streaming (downstream_mode=stream)
+
+Controls the pacing and robustness of streamed agent audio.
+
+- streaming.sample_rate: Output sample rate (typically 8000 for telephony).
+- streaming.jitter_buffer_ms: 80–150 ms. Higher = more robust to jitter, slightly higher latency.
+- streaming.keepalive_interval_ms: TCP keepalive interval for streaming connections.
+- streaming.connection_timeout_ms: Time to consider a streaming connection dead.
+- streaming.fallback_timeout_ms: No audio for this long triggers fallback to file playback.
+- streaming.chunk_size_ms: 20 ms recommended for telephony cadence.
+- streaming.min_start_ms: 250–400 ms. Warm‑up buffer before first frame; too low risks underruns.
+- streaming.low_watermark_ms: Brief pause/guard band; increase if underruns occur.
+- streaming.provider_grace_ms: Absorb late provider chunks to avoid tail-chop artifacts.
+- streaming.logging_level: Verbosity for the streaming manager.
+- streaming.egress_force_mulaw: When true, converts outbound streaming audio to μ-law 8 kHz regardless of provider encoding.
+- streaming.greeting_rtp_wait_ms: ExternalMedia-only. How long to wait (ms) for the remote RTP endpoint to be discovered during the initial greeting before falling back to file playback (prevents “dead air until caller speaks” in some Asterisk setups).
+
+## VAD (Voice Activity Detection)
+
+Defines how inbound speech is segmented into utterances for STT.
+
+- vad.webrtc_aggressiveness: 0–3. 0=least aggressive (best for 8 kHz telephony), 3=most aggressive (may clip speech).
+- vad.webrtc_start_frames: Consecutive frames above threshold to start recording.
+- vad.webrtc_end_silence_frames: Silence frames to finalize an utterance (e.g., 50 → ~1000 ms at 20 ms frames).
+- vad.min_utterance_duration_ms: Lower bound on utterance length. Raise if STT returns empty.
+- vad.max_utterance_duration_ms: Hard cap to prevent runaway capture.
+- vad.utterance_padding_ms: Padding around detected speech.
+- vad.fallback_enabled: When true, sends audio at a fixed interval if VAD fails to detect speech.
+- vad.fallback_interval_ms: Interval between fallback sends.
+- vad.fallback_buffer_size: Bytes to accumulate at fallback thresholds.
+- vad.upstream_squelch_enabled: When true, replaces low-energy/noise frames with silence for continuous-audio providers that have native VAD (improves end-of-turn detection in noisy environments; may suppress quiet callers if too aggressive).
+- vad.upstream_squelch_base_rms: Minimum RMS threshold (PCM16 space) before audio is treated as “speech”.
+- vad.upstream_squelch_noise_factor: Dynamic threshold multiplier relative to estimated noise floor.
+- vad.upstream_squelch_noise_ema_alpha: EMA smoothing factor (0–1) for noise floor estimation.
+- vad.upstream_squelch_min_speech_frames: Hysteresis: speech frames required to enter “speaking”.
+- vad.upstream_squelch_end_silence_frames: Hysteresis: silence frames required to exit “speaking”.
+
+Common pitfalls:
+
+- Too-short utterances (e.g., 20 ms) cause empty STT transcripts → raise `min_utterance_duration_ms` and ensure `webrtc_end_silence_frames` is not too low.
+- Overly aggressive VAD (aggressiveness=2/3) may clip 8 kHz speech; prefer 0–1 for telephony.
+
+## Caller inactivity (`no_input`)
+
+The engine-level watchdog prevents an answered call from remaining open indefinitely when the caller stops responding. It is independent of provider endpointing/VAD: timing runs only while the conversation is ready and the caller, agent, and model are all idle.
+
+- `no_input.enabled`: Enables the policy. Defaults to `true`.
+- `no_input.inbound_enabled`: Applies the policy to inbound calls. Defaults to `true`.
+- `no_input.outbound_enabled`: Compatibility/default field; outbound calls still require the equivalent per-Agent option under **Agents → Caller Inactivity Overrides**.
+- `no_input.initial_timeout_sec`: Idle time before the first check-in. Defaults to 30 seconds.
+- `no_input.grace_timeout_sec`: Reply window after each check-in. Defaults to 15 seconds.
+- `no_input.max_check_ins`: Number of check-ins before the final message and hangup. Defaults to 1; `0` skips directly to the final message.
+- `no_input.check_in_message`: Check-in text, spoken by the active provider/pipeline in the agent's configured voice.
+- `no_input.final_message`: Non-empty text spoken before the ARI hangup. Blank or whitespace-only per-agent values inherit the safe default.
+
+Caller media activity, provider speech-start events, and user transcripts reset the window. The timer pauses during greetings, agent TTS, LLM processing, sustained caller speech, and other output gating. A terminal watchdog hangup is stored in Call History as `no_input_timeout`, not as a provider error.
+
+Provider generation completion is not treated as caller playback completion. Before terminal hangup, the engine also drains provider/coalescing queues, jitter frames, frame remainder, active ARI playback, and a short transport-specific post-roll. This applies uniformly to AudioSocket and ExternalMedia/RTP; pipeline/file announcements use Asterisk `PlaybackFinished` as their authoritative boundary.
+
+Per-agent overrides are partial and inherit every omitted global field. In the Admin UI, configure global defaults under **Advanced Settings → Voice Activity Detection → Caller Inactivity** and agent-specific values under **Agents → Edit Agent → Caller Inactivity Overrides**.
+
+For ElevenLabs full-agent deployments, also follow the provider-side client-event and silence ownership settings in [Provider-ElevenLabs-Setup.md](Provider-ElevenLabs-Setup.md#ava-caller-inactivity-compatibility-v731).
+
+## LLM block
+
+- llm.initial_greeting: First message spoken by the agent (if provider supports explicit greeting or engine plays via TTS).
+- llm.prompt: Persona/system instruction used by LLMs.
+- llm.api_key: Optional API key for LLMs that require it.
+
+## Providers
+
+### OpenAI Realtime (monolithic agent)
+
+- providers.openai_realtime.api_key: injected from `OPENAI_API_KEY` (env-only; do not commit secrets to YAML).
+- providers.openai_realtime.api_version: `ga` (default) or `beta` (legacy payload/header behavior).
+- providers.openai_realtime.model, voice, base_url: Model and voice.
+- providers.openai_realtime.instructions: Persona override. Leave empty to inherit `llm.prompt`.
+- providers.openai_realtime.greeting: Explicit greeting. Leave empty to inherit `llm.initial_greeting`.
+- providers.openai_realtime.response_modalities: list of modalities, typically `[\"audio\"]` or `[\"audio\", \"text\"]`.
+- providers.openai_realtime.provider_input_encoding/provider_input_sample_rate_hz: Format sent to OpenAI (typically PCM16); prefer matching this to the engine’s internal PCM rate to avoid extra resampling.
+- providers.openai_realtime.input_encoding/input_sample_rate_hz: Inbound format; use `ulaw` at 8 kHz when AudioSocket() is invoked with `,ulaw` (engine converts to PCM before sending to OpenAI).
+- providers.openai_realtime.output_encoding/output_sample_rate_hz: Provider output; for telephony, prefer `mulaw` at 8 kHz (for example: `output_encoding: mulaw`, `output_sample_rate_hz: 8000`) to avoid mid-stream PCM → μ-law conversion artifacts.
+- providers.openai_realtime.target_encoding/target_sample_rate_hz: Downstream transport expectations (e.g., μ‑law at 8 kHz).
+- providers.openai_realtime.egress_pacer_enabled: When true, OpenAI provider emits fixed 20 ms audio cadence (silence on underrun); prefer `false` when downstream playback already paces reliably.
+- providers.openai_realtime.turn_detection: Server‑side VAD (type, silence_duration_ms, threshold, prefix_padding_ms); improves turn handling.
+  - Metrics: `ai_agent_openai_assumed_output_sample_rate_hz`, `ai_agent_openai_provider_output_sample_rate_hz`, and `ai_agent_openai_measured_output_sample_rate_hz` are **low-cardinality gauges** (latest observed across calls). Use Call History for per-call debugging.
+
+### xAI Grok Voice Agent (monolithic agent, NEW in v6.5.2)
+
+- providers.grok.api_key: injected from `XAI_API_KEY` (env-only legacy fallback for single-instance setups). Multi-instance deployments should use per-instance `api_key_file: /app/project/secrets/providers/<provider_key>/api-key` instead — never commit secrets to YAML.
+- providers.grok.model: `grok-voice-latest` (default; xAI's only published Voice Agent model as of v6.5.2).
+- providers.grok.voice: One of `eve`, `ara`, `rex`, `sal`, `leo`, or a custom cloned-voice ID from your xAI workspace.
+- providers.grok.instructions / greeting: Persona override + explicit greeting. Leave empty to inherit `llm.prompt` / `llm.initial_greeting`.
+- providers.grok.input_encoding / input_sample_rate_hz: AudioSocket inbound format. Default `ulaw` @ 8 kHz (matches Asterisk telephony format with no resampling).
+- providers.grok.provider_input_encoding / provider_input_sample_rate_hz: Format actually sent to xAI. Default `ulaw` @ 8 kHz (xAI accepts `audio/pcmu` natively). Set to `linear16` @ 24 kHz for wideband AudioSocket (`slin16`) setups.
+- providers.grok.output_encoding / output_sample_rate_hz: Provider output observed from xAI. Default `linear16` @ 24 kHz; AAVA converts it to the configured transport target.
+- providers.grok.target_encoding / target_sample_rate_hz: Caller-facing Asterisk transport target. Default `ulaw` @ 8 kHz.
+- providers.grok.turn_detection: Server-side VAD (default `server_vad` with `threshold: 0.5`, `silence_duration_ms: 600`, `prefix_padding_ms: 300`). Named Grok instances inherit the canonical `grok` runtime block before applying instance overrides.
+- providers.grok.session_warn_after_seconds: Conservative long-session warning threshold (default `1680` = 28 minutes; set to `0` to disable). xAI's current model page lists a 120-minute maximum; the earlier warning remains for compatibility and is not a statement of the current provider limit.
+- providers.grok.extra_tools: YAML escape hatch for xAI-native tools (`web_search`, `x_search`, `file_search`, `mcp`) not exposed in the Admin UI. Forwarded verbatim into `session.update.tools`. See [docs/Provider-Grok-Setup.md](Provider-Grok-Setup.md).
+- providers.grok.display_name / customer: Free-text labels surfaced in the Admin UI and call-history attribution. Used to identify multi-instance deployments.
+
+xAI does not consistently send `session.updated` ACK; the provider waits ~2s and proceeds either way. See [docs/Provider-Grok-Setup.md](Provider-Grok-Setup.md) for current audio, VAD, interruption, announcement, and long-session behavior, and [docs/Multi-Instance-Full-Agent-Providers.md](Multi-Instance-Full-Agent-Providers.md) for multi-instance routing.
+
+### OpenAI (pipelines)
+
+Modular OpenAI pipeline components use `type: openai` provider blocks:
+
+- `openai_llm`: Chat Completions (`chat_base_url`, `chat_model`)
+- `openai_stt`: Speech-to-Text via `audio/transcriptions` (`stt_base_url`, `stt_model`)
+- `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `response_format`)
+
+Public OpenAI endpoints require an API key. Configure a provider-scoped
+`api_key_file`, `api_key_env`, or an `api_key` reference such as
+`${OPENAI_API_KEY}`. Custom OpenAI-compatible servers use their own credentials
+or the `not-needed` sentinel when authentication is disabled.
+
+### Admin UI modular HTTP provider tests
+
+**Test Connection** tests the current provider form, including unsaved edits.
+The saved-provider credential verification API uses the saved configuration.
+OpenAI-compatible, Telnyx (including legacy `telenyx`), MiniMax and Groq Speech
+connection tests use the declared type and capability; names containing
+`local`, `telnyx` or `elevenlabs` do not override an explicit modular type.
+
+- LLM tests select `chat_base_url`, then legacy `base_url`, then the provider
+  default, and request `/models`. Configured ports and API paths are preserved.
+  A successful model list establishes connectivity/authentication, not model
+  entitlement or chat inference. Telnyx **Test Connection** additionally makes
+  its existing minimal chat-completion probe; credential verification does not.
+- OpenAI/Groq speech tests select `stt_base_url` or `tts_base_url` as complete
+  resource URLs. A successful GET or HTTP 405 establishes endpoint reachability
+  only; it does not verify authentication, transcription or synthesis.
+- Credentials resolve from the provider's key file, explicit key environment
+  variable, inline value/reference, then applicable legacy provider variables.
+  Admin tests read fresh `.env` values before container environment values.
+  A custom OpenAI-compatible instance does not inherit an unrelated
+  `OPENAI_API_KEY`. Set `api_key: not-needed` for a custom no-auth endpoint;
+  the test sends no Authorization header and still probes that endpoint.
+  The sentinel is rejected for the recognized public provider service hosts.
+- HTTP(S) URLs must be absolute, with valid hosts/ports and without embedded
+  credentials, whitespace, queries or fragments. Public custom endpoints
+  require HTTPS. HTTP is permitted for loopback, RFC1918 LAN and IPv6 ULA
+  targets, including hostnames resolving exclusively to those addresses.
+  Metadata/link-local, multicast, unspecified and other special-use targets
+  are blocked. Redirects are disabled. Rejected or failed explicit endpoints
+  never trigger requests to alternate providers.
+- Custom hostname resolution has a three-second budget. HTTP probes have a
+  twenty-second total budget and ten-second per-operation timeouts. Results
+  and logs show the destination origin (scheme/host/port), not arbitrary paths,
+  credentials, headers, response bodies or exception internals. Editor results
+  disappear when configuration changes, and late responses after an edit or
+  closing/reopening the editor are ignored. Separate provider cards can test
+  concurrently without clearing each other's results. Testing does not save
+  or apply the form.
+
+The authenticated routes are:
+
+| Route | Configuration tested | Successful validation level |
+| --- | --- | --- |
+| `POST /api/config/providers/test` | Submitted `{name, config}`, including unsaved editor changes | `authentication` for keyed LLM model lists, `connectivity` for no-auth model lists, `inference` for the additional Telnyx chat probe, or `reachability` for speech |
+| `POST /api/config/providers/{provider_key}/credentials/verify` | Saved modular OpenAI-compatible, Telnyx/Telenyx or MiniMax provider | Model-list `authentication`/`connectivity`, or speech `reachability`; no chat probe |
+
+Groq LLM instances use `type: openai` with their Groq `chat_base_url` and
+credential source. Groq speech connection tests use `type: groq`.
+For backward compatibility, a submitted `groq_llm` configuration without an
+explicit type or endpoint defaults to `https://api.groq.com/openai/v1`.
+Explicit types and supplied URLs remain authoritative.
+An explicitly typed `groq_llm` with `type: openai` must supply `chat_base_url` or
+`base_url` for either validation API. Missing URLs are rejected before sending
+credentials, so a Groq key cannot be sent to OpenAI through an ambiguous default.
+
+For example, this disabled provider probes
+`http://127.0.0.1:8088/custom/api/v2/models` without authentication:
+
+```yaml
+providers:
+  private_llm:
+    type: openai
+    capabilities: [llm]
+    enabled: false
+    chat_base_url: http://127.0.0.1:8088/custom/api/v2
+    chat_model: your-served-model
+    api_key: not-needed
+```
+
+Use this example only for a server that intentionally accepts unauthenticated
+requests. For a keyed server, replace `api_key: not-needed` with an explicit
+`api_key_env` or managed `api_key_file`. The endpoint must be reachable from the
+Admin UI container; loopback refers to that container's network namespace,
+not the computer running the browser. See the
+[provider test troubleshooting guide](TROUBLESHOOTING_GUIDE.md#modular-provider-connection-tests)
+for interpreting failures.
+
+These APIs require Admin UI authentication. Custom hostname checks resolve
+DNS separately from HTTP connection establishment, leaving a DNS-rebinding
+TOCTOU limitation. Admin UI already has host-level access through its project
+and Docker-socket mounts; keep it on a trusted network and use network egress
+controls where a hard destination boundary is required. No global SSRF bypass
+or new configuration setting is introduced by these provider-test changes.
+
+### Telnyx AI Inference (pipelines)
+
+Telnyx AI Inference is supported as a modular LLM component:
+
+- `telnyx_llm`: OpenAI-compatible Chat Completions (`chat_base_url`, `chat_model`, `temperature`, `max_tokens`, `response_timeout_sec`, `api_key_ref`)
+
+Requirements:
+
+- `TELNYX_API_KEY` must be set in the environment.
+
+Notes:
+
+- Telnyx supports many model IDs. Use the exact model ID returned by Telnyx `/models`.
+- Some model IDs represent **external providers** (for example `openai/gpt-4o`). Those require `providers.telnyx_llm.api_key_ref` to be set (Integration Secret identifier) or Telnyx will return `400` with "OpenAI API key required…".
+- For pipeline selection, set `AI_PROVIDER=telnyx_hybrid` (pipeline name) in your dialplan when forcing a per-extension pipeline.
+
+### Deepgram Voice Agent
+
+- providers.deepgram.api_key: injected from `DEEPGRAM_API_KEY` (env-only; do not commit secrets to YAML).
+- The default Think stage uses Deepgram-managed reasoning and does not consume or require `OPENAI_API_KEY`. Custom/BYO reasoning endpoints are not currently exposed by this provider configuration.
+- `providers.deepgram.model`: Deepgram Voice Agent listen model. The verified UI surface is `nova-3`, `flux-general-en`, and `flux-general-multi`; `nova-2-phonecall` is a legacy English telephony compatibility option. Existing custom values are preserved.
+- `providers.deepgram.tts_model`: Aura voice model. Its language suffix must match `agent_language`; unknown or mismatched voices fail the Deepgram call before Settings are sent rather than silently falling back.
+- `providers.deepgram.agent_language`: Full Voice Agent conversation language (default: `en`). Supported end-to-end languages are `en`, `es`, `de`, `fr`, `it`, `nl`, and `ja`; BCP-47 variants are normalized to their base language. This is separate from modular pipeline `stt_language`.
+- providers.deepgram.greeting: Agent greeting. Leave empty to inherit `llm.initial_greeting`.
+- providers.deepgram.instructions: Persona override for the “think” stage; leave empty to inherit `llm.prompt`.
+- providers.deepgram.input_encoding/input_sample_rate_hz: Keep `input_encoding=ulaw` at 8 kHz when AudioSocket runs μ-law transport.
+- providers.deepgram.continuous_input: true to stream audio continuously.
+  - Metrics: `ai_agent_deepgram_input_sample_rate_hz` and `ai_agent_deepgram_output_sample_rate_hz` are **low-cardinality gauges** (latest observed across calls). Use Call History for per-call debugging.
+
+### Google (pipelines)
+
+- google_llm.system_instruction/system_prompt: Persona; if missing, adapter falls back to `llm.prompt`.
+- google_tts/tts fields: voice, language, audio encoding/sample rate, target format.
+- google_stt/stt fields: encoding, language, model, sampleRateHertz.
+
+### Groq Speech (pipelines)
+
+Groq Speech uses OpenAI-compatible REST endpoints:
+
+- STT: `https://api.groq.com/openai/v1/audio/transcriptions`
+- TTS: `https://api.groq.com/openai/v1/audio/speech` (Orpheus, WAV-only)
+
+Requirements:
+
+- `GROQ_API_KEY` must be set in the environment.
+
+Config notes:
+
+- `groq_stt` options: `stt_model` (`whisper-large-v3-turbo`, `whisper-large-v3`), plus optional `language`, `prompt`, `response_format` (`json|verbose_json|text`), `temperature`, `timestamp_granularities`.
+- `groq_tts` options: `tts_model` (`canopylabs/orpheus-v1-english`, `canopylabs/orpheus-arabic-saudi`), `voice` (Orpheus voice IDs), `response_format` (`wav` only), and output format controls (`target_encoding`/`target_sample_rate_hz` or pipeline `tts.format`).
+
+### Local provider (pipelines)
+
+- Local STT/LLM/TTS parameters live under pipeline `options`. The engine plays `llm.initial_greeting` first if configured.
+
+### Google Live (monolithic agent)
+
+- `providers.google_live.api_key`: injected from `GOOGLE_API_KEY` (env-only; do not commit secrets to YAML).
+- `providers.google_live.llm_model`: Live LLM model name (see `config/ai-agent.yaml` for shipped defaults).
+- `providers.google_live.tts_voice_name`: Live voice name (provider-specific).
+- `providers.google_live.response_modalities`: `audio`, `text`, or `audio_text` (provider behavior varies by model generation).
+- `providers.google_live.long_audio_playback_enabled`: boolean, default `false`. Opts this instance into bounded long-response playback on the actual Developer API connection only. UI: **Providers → Google Live → API Mode → Enable long-response playback**; hidden in Vertex mode. Existing installations are not automatically opted in. Save and restart the AI Engine to enable or disable it.
+- `providers.google_live.long_audio_backlog_sec`: seconds of queued-audio capacity, default `120`, inclusive range `10–120`. Advanced YAML setting used only when long-response playback is enabled on Developer API; not a total response-duration limit. Overflow or stalled drain terminates the call with an explicit error. See [long-response setup, limits and validation](Provider-Google-Setup.md#long-response-playback-developer-api-opt-in).
+- `providers.google_live.hangup_fallback_audio_idle_sec`: idle-audio timeout after hangup is armed.
+- `providers.google_live.hangup_fallback_min_armed_sec`: minimum armed duration before fallback can fire.
+- `providers.google_live.hangup_fallback_no_audio_timeout_sec`: timeout when provider emits no farewell audio.
+- `providers.google_live.hangup_fallback_turn_complete_timeout_sec`: grace period waiting for `turnComplete` before fallback hangup.
+- `providers.google_live.hangup_markers_enabled`: enable/disable marker-based hangup heuristics (end_call / assistant_farewell) used to arm `cleanup_after_tts`. Recommended `false` for production (prefer tool-driven hangup via `hangup_call`).
+- `providers.google_live.ws_keepalive_enabled`: enable protocol-level WebSocket ping keepalive (pings only fire when the connection is idle).
+- `providers.google_live.ws_keepalive_interval_sec`: ping interval when keepalive is enabled.
+- `providers.google_live.ws_keepalive_idle_sec`: minimum idle time (no `realtimeInput`) before sending a ping.
+
+### Deepgram Voice Agent (monolithic agent)
+
+- `providers.deepgram.voice_agent_base_url`: WebSocket endpoint for Deepgram Voice Agent.
+  - Default: `wss://agent.deepgram.com/v1/agent/converse`
+  - YAML overrides allow regional endpoints or proxy URLs.
+
+### ElevenLabs Agent (monolithic agent)
+
+Full agent provider using ElevenLabs Conversational AI for premium voice quality.
+
+> **Scope Note**: ElevenLabs is supported as a full agent (`elevenlabs_agent`) and as a TTS-only pipeline adapter (`elevenlabs_tts`).
+
+- `providers.elevenlabs_agent.api_key`: injected from `ELEVENLABS_API_KEY` (env-only; do not commit secrets to YAML).
+- `providers.elevenlabs_agent.agent_id`: injected from `ELEVENLABS_AGENT_ID` (env-only).
+- `providers.elevenlabs_agent.voice_id`: Voice ID for TTS output (configured in agent dashboard).
+- `providers.elevenlabs_agent.model_id`: Model ID (e.g., `eleven_flash_v2_5`).
+- `providers.elevenlabs_agent.voice_settings`: Optional object with `stability`, `similarity_boost`, `style` (0.0-1.0).
+
+**Tool Calling**: ElevenLabs tools must be defined in the ElevenLabs dashboard. The engine executes tool calls locally based on matching function names. See [ElevenLabs Implementation Guide](contributing/references/Provider-ElevenLabs-Implementation.md) for tool schema format.
+
+**Audio Format**: ElevenLabs uses PCM16 at 16kHz. The engine automatically resamples from telephony μ-law 8kHz.
+
+Example:
+```yaml
+providers:
+  elevenlabs_agent:
+    enabled: true
+    voice_id: "pNInz6obpgDQGcFmaJgB"
+    model_id: "eleven_flash_v2_5"
+```
+
+## Precedence summary
+
+- Provider/pipeline explicit overrides (instructions/greeting) take priority.
+- Otherwise providers/pipelines inherit `llm.prompt` / `llm.initial_greeting`.
+- Env `AI_ROLE`/`GREETING` act as defaults when YAML does not specify values.
+
+## Health & Contexts
+
+- Health endpoint:
+  - `health.host`: Bind address for `/live`, `/ready`, `/health`, and `/metrics` (default `127.0.0.1`).
+  - `health.port`: Port for the health/metrics HTTP server (default `15000`).
+  - Environment variables `HEALTH_BIND_HOST` / `HEALTH_BIND_PORT` override the YAML values when set.
+- Contexts:
+  - Inline: `contexts:` block in `config/ai-agent.yaml` defines named contexts (prompt, greeting, profile, provider, tools).
+  - External: YAML files in `config/contexts/*.yaml` are also loaded.
+    - Each file must define a `name` field; that becomes the context key.
+    - `system_prompt` in external files is treated as `prompt` if `prompt` is not present.
+    - If the same context `name` exists both inline and in an external file, the inline definition in `ai-agent.yaml` wins.
+
+### Context Options
+
+Each context supports the following fields:
+
+- `prompt`: System prompt/persona instructions for the AI.
+- `greeting`: Initial greeting spoken when call connects.
+- `profile`: Audio profile name to use for this context.
+- `provider`: Provider override for this context.
+- `tools`: List of **in-call** tool names to enable for this context.
+- `pre_call_tools`: List of pre-call tool names to run after answer, before the AI speaks (HTTP lookups/enrichment).
+- `in_call_http_tools`: List of in-call HTTP tool names to allowlist for this context (defined under `in_call_tools:`).
+- `post_call_tools`: List of post-call tool names to run after the call ends (webhooks/automation).
+- `disable_global_pre_call_tools`: Disable specific global pre-call tools for this context.
+- `disable_global_in_call_tools`: Disable specific global in-call tools for this context.
+- `disable_global_post_call_tools`: Disable specific global post-call tools for this context.
+- `connection_audio`: Optional caller-only Asterisk ARI media URI played after answer while the provider or pipeline initializes. `tone:ring` repeats until stopped; omit or leave empty to disable it.
+- `background_music`: Music On Hold class name for ambient music during calls (see below).
+
+### Connection Audio / Ringback
+
+Connection audio removes silent wait time between answer and the initial greeting without injecting audio into the provider, STT, or VAD path. The engine targets the caller channel and stops playback immediately before the first provider or pipeline greeting audio. Cleanup and provider-start failures also stop it.
+
+- Recommended value: `tone:ring` (continuous local ringback until the greeting is ready).
+- Optional locale: `tone:ring;tonezone=fr` (replace `fr` with an installed Asterisk tone zone).
+- Local prompt: `sound:custom/please-wait` (plays once; the sound must exist on Asterisk).
+- Remote URLs and `file:` URIs are rejected. Leave the field empty to disable connection audio.
+
+In the Admin UI, edit an agent and enable **Play ringback while connecting**. The value is stored in the agent's `extra_json`, exported as `connection_audio`, and works identically for full-agent providers and modular pipelines.
+
+Configure these overrides under **Agents → Edit Agent → Caller Inactivity Overrides**.
+Agent persona and policy fields live in `agents.db`; legacy `contexts:` YAML is accepted
+only as one-time migration input and is not a live v7.4 configuration surface.
+
+### HTTP Tools (Phase Tools)
+
+HTTP tools are configured in YAML and/or via the Admin UI:
+
+- **Pre-call HTTP lookups**: live under `tools:<name>` with `kind: generic_http_lookup` and `phase: pre_call`.
+- **Post-call webhooks**: live under `tools:<name>` with `kind: generic_webhook` and `phase: post_call`.
+- **In-call HTTP tools**: live under `in_call_tools:<name>` with `kind: in_call_http_lookup` (AI-invoked during conversation).
+
+See `docs/TOOL_CALLING_GUIDE.md` for full examples and variable substitution details.
+
+### Background Music
+
+Play ambient music during AI conversations. Music is mixed into the call audio.
+
+- Agent `background_music`: MOH class name stored in the Agent's advanced fields (e.g., `default`, `ambient`).
+  - When set, a snoop channel with Music On Hold starts when the call begins.
+  - Music continues until the call ends.
+  - Leave empty/omit to disable background music.
+
+**Setup Requirements**:
+
+1. Place audio files in `/var/lib/asterisk/moh/<class-name>/`
+2. For FreePBX: Configure via **Settings → Music On Hold**
+3. Supported formats: WAV, ulaw, alaw, sln, mp3
+
+**Best Practices**:
+
+- Use low-volume (15-20%) ambient/instrumental music
+- Music is heard by the AI (affects VAD); loud music reduces accuracy
+- Test with real calls before production
+
+Example:
+```yaml
+contexts:
+  support:
+    greeting: "Hello, how can I help?"
+    prompt: "You are a helpful support agent."
+    background_music: "ambient"  # MOH class name
+```
+
+## Environment Variable Resolution
+
+Environment variable placeholders (`${VAR}`, `${VAR:-default}`) are expanded for the **entire YAML file** when `config/ai-agent.yaml` is loaded.
+
+Example (supported):
+```yaml
+providers:
+  local:
+    base_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}  # ✅ Resolved
+```
+
+Notes:
+- Expansion happens **before YAML parsing**. Use `${VAR:-default}` to avoid empty-string surprises.
+- Avoid putting secrets directly in YAML; prefer `.env` + `${VAR}` placeholders.
+
+## Admin UI HTTP Tool Testing (Security)
+
+The Admin UI includes an HTTP tool **Test** feature that makes real outbound HTTP requests.
+
+By default, the Admin UI blocks test requests to localhost/private targets to reduce SSRF risk if the UI is exposed beyond a trusted network.
+
+> **Security note (accepted limitation):** the private-target check resolves DNS separately from the outbound HTTP connection, so a residual DNS-rebinding TOCTOU window exists. This is acceptable because the endpoint is admin-only and authenticated — do not rely on it as a hard SSRF boundary on an untrusted network.
+
+- `AAVA_HTTP_TOOL_TEST_ALLOW_PRIVATE=1`: allow private/localhost targets (trusted network only).
+- `AAVA_HTTP_TOOL_TEST_ALLOW_HOSTS=host1,host2`: allow specific hostnames.
+- `AAVA_HTTP_TOOL_TEST_FOLLOW_REDIRECTS=1`: allow redirects (default is disabled).
+
+**v6.5.0+:** the guard reads `.env` before `os.environ`, so changes made through the Admin UI Environment page take effect on the next test request without recreating the `ai_engine` container. `.env` read failures fail closed (helpers fall back to the default rather than silently consulting `os.environ`).
+
+
+## Tips
+
+- For noisy trunks, start with:
+  - `barge_in.energy_threshold=2200`, `barge_in.min_ms=450`, `vad.webrtc_aggressiveness=1`.
+- For lowest latency, start with:
+  - `streaming.min_start_ms=250`, `streaming.jitter_buffer_ms=80`, `barge_in.min_ms=300` (expect more sensitivity to jitter).
+
+## MCP (Experimental)
+
+MCP-backed tools (Model Context Protocol) can be exposed through the existing tool calling system.
+
+- Design + configuration guide: `docs/MCP_INTEGRATION.md`
+
+## Fish Audio TTS (`fishaudio_tts`)
+
+Full setup walkthrough: [Provider-FishAudio-Setup.md](Provider-FishAudio-Setup.md).
+
+Native support for [Fish Audio](https://fish.audio) speech models (S1, S2 and the
+drama preview). Fish Audio returns raw PCM over a chunked HTTP response, at a
+sample rate you choose, so the adapter asks for the call's own rate: on a
+telephone call the audio is produced at 8 kHz, converted to µ-law chunk by chunk
+and forwarded while the sentence is still being synthesised.
+
+### Credentials
+
+```bash
+# .env
+FISH_AUDIO_API_KEY=your-api-key
+FISH_AUDIO_REFERENCE_ID=voice-model-id
+```
+
+The Admin UI can instead store a provider-scoped API key in an owner-only file.
+The engine resolves `api_key_file`, `api_key_env`, an inline key, then the legacy
+`FISH_AUDIO_API_KEY` fallback. A pipeline with a missing key or voice reference
+is invalid at startup and fails closed; AVA never substitutes another TTS voice.
+
+### Provider configuration
+
+```yaml
+providers:
+  fishaudio_tts:
+    type: fishaudio
+    capabilities:
+      - tts
+    enabled: true
+    transport: http        # http, or websocket for the realtime session
+    model: s2.1-pro        # also: s1, s2-pro, s2.1-pro-free, drama-3-preview
+    reference_id: voice-model-id # required voice id from your Fish Audio library
+    audio_format: pcm      # pcm (streamed) or wav (buffered)
+    sample_rate: null      # null follows the call: 8 kHz telephony, 16 kHz wideband
+    latency: low           # low, normal, balanced
+    chunk_length: 200      # 100-300, provider-side synthesis granularity
+    normalize: true
+    temperature: 0.7
+    top_p: 0.7
+    speed: null            # prosody.speed override
+    volume: null           # prosody.volume override
+    connect_timeout_sec: 10
+    read_timeout_sec: 30
+    output_resampler: inherit
+```
+
+| Key | Purpose |
+|---|---|
+| `model` | Sent as the `model` HTTP header, which is how Fish Audio selects the speech model. `s2.1-pro-free` needs no API credit, which is handy for a live check. |
+| `reference_id` | Required voice model id (a voice from the Fish Audio library, or one you cloned). |
+| `audio_format` | `pcm` streams chunk by chunk and is recommended for calls; `wav` is read in full, then decoded. |
+| `sample_rate` | Leave `null` to follow the negotiated transport. A rate Fish Audio cannot emit falls back to 16 kHz and is resampled locally. |
+| `latency` | `low` favours time to first audio, which is what a phone call needs. |
+| `speed`, `volume` | Sent as `prosody`; leave `null` to keep the model default. |
+| `connect_timeout_sec` | Maximum time to establish or acquire the HTTP connection. |
+| `read_timeout_sec` | Maximum gap between HTTP chunks or realtime WebSocket events. This fails a stalled stream without imposing a deadline on healthy long synthesis. |
+| `transport` | `http` posts one request per fragment. `websocket` opens one realtime session per turn and receives the text as the engine produces it (needs `msgpack`). |
+| `ws_base_url` | Realtime endpoint; defaults to `base_url` with a `ws`/`wss` scheme. Remote endpoints require WSS; plain WS is limited to explicit loopback mocks. |
+
+Every key can also be set per pipeline under `options.tts`, and overridden per
+request at runtime.
+
+### Example pipeline
+
+```yaml
+pipelines:
+  hybrid_fishaudio:
+    stt: local_stt
+    llm: openai_llm
+    tts: fishaudio_tts
+    options:
+      tts:
+        format:
+          encoding: mulaw
+          sample_rate: 8000
+```
+
+### Tests
+
+```bash
+pytest tests/test_pipeline_fish_audio_adapters.py          # mocked HTTP
+FISH_AUDIO_API_KEY=... pytest -m integration tests/test_pipeline_fish_audio_adapters.py
+```
+
+Without an account, `scripts/fish_audio_mock.py` answers like the service does
+(Bearer auth, `model` header, body validation, chunked audio) so the whole path
+can be exercised, including a call end to end:
+
+```bash
+python scripts/fish_audio_mock.py &
+FISH_AUDIO_API_KEY=mock-key FISH_AUDIO_BASE_URL=http://127.0.0.1:8788/v1 \
+    pytest -m integration tests/test_pipeline_fish_audio_adapters.py
+```
+
+Set `base_url: http://127.0.0.1:8788/v1` on the provider to route a real call
+through the mock. It serves a generated tone by default; set
+`FISH_MOCK_LOCAL_WS=ws://127.0.0.1:8765` to hear speech from a local AI server
+instead. The request text also carries hooks — `FISH_MOCK_401`,
+`FISH_MOCK_SLOW`, `FISH_MOCK_EMPTY` — to check how failures are handled.
+
+The integration test is skipped unless both `FISH_AUDIO_API_KEY` and
+`FISH_AUDIO_REFERENCE_ID` are set.

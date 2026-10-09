@@ -1,0 +1,143 @@
+# MCA-phone production stack.
+#
+# Two halves that share one .env:
+#   1. postgres + mca-mail  — the existing MCA gateway (same shape as
+#      MCA-Mail/docker-compose.yml). The voice REST API lives here on
+#      127.0.0.1:8080 and is the authority for leads/requirements.
+#   2. ai_engine + local_ai_server — AVA (Asterisk AI Voice Agent), wired to
+#      the MCA API by prod/ai-agent.yaml. Uses host networking because the
+#      telephony path (ARI + AudioSocket to Asterisk) needs loopback.
+#
+# Operator notes:
+#   - AVA sources come from ${AVA_REPO} (default ../../ava — the copy vendored
+#     into this repository).
+#   - MCA-Mail sources come from ${MCA_MAIL_REPO} (default: the sibling
+#     checkout used to build this file).
+#   - ai_engine reaches the API at 127.0.0.1:8080 (host network), so
+#     set MCA_API_URL=http://127.0.0.1:8080 in .env.
+#   - Do not run this alongside AVA's own docker-compose.yml on one host
+#     (container names ai_engine / local_ai_server would collide).
+
+name: mca-phone
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mca
+      # Overridable per environment; the default keeps a fresh clone working.
+      # DATABASE_URL below reads the same variable, so the two cannot drift.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mca}
+      POSTGRES_DB: mca_mail
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mca"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: &log-rotation
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  mca-mail:
+    build:
+      context: ${MCA_MAIL_REPO:-../../MCA-Mail}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgres://mca:${POSTGRES_PASSWORD:-mca}@postgres:5432/mca_mail
+      # Voice channel requires nothing more than the base API. Mail gates are
+      # kept off unless this host is also the email responder.
+      MAIL_MODE: ${MAIL_MODE:-read_only}
+      EMAIL_MODE: ${EMAIL_MODE:-manual}
+      EMAIL_AUTO_SEND: ${EMAIL_AUTO_SEND:-false}
+      SEND_MANAGER_CARD: ${SEND_MANAGER_CARD:-false}
+      BACKUP_ENABLED: ${BACKUP_ENABLED:-false}
+    volumes:
+      - backups:/app/backups
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging: *log-rotation
+
+  ai_engine:
+    image: asterisk-ai-voice-agent-ai-engine:latest
+    pull_policy: build
+    build:
+      context: ${AVA_REPO:-../../ava}
+      dockerfile: Dockerfile
+      network: host
+      args:
+        # Align with the Asterisk user/group on the voice host
+        # (FreePBX default is 995). Find it with: id -u asterisk / id -g asterisk
+        ASTERISK_GID: ${ASTERISK_GID:-995}
+    container_name: ai_engine
+    # Container runs as appuser (member of the asterisk group via Dockerfile).
+    user: "appuser"
+    network_mode: host
+    volumes:
+      # Voice-channel persona + MCA tool wiring. Single-file overlay: the rest
+      # of /app/config comes from the built image.
+      - ./ai-agent.yaml:/app/config/ai-agent.yaml:ro
+      - ./data:/app/data
+      - ./asterisk_media:/mnt/asterisk_media
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      # ATERISK_HOST / LLM keys / MCA_* come from .env (env_file above).
+      # Health endpoint binds 0.0.0.0 so the Admin UI / external probes reach it.
+      - HEALTH_BIND_HOST=0.0.0.0
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+    logging: *log-rotation
+
+  local_ai_server:
+    image: asterisk-ai-voice-agent-local-ai-server:latest
+    pull_policy: build
+    build:
+      context: ${AVA_REPO:-../../ava}/local_ai_server
+      dockerfile: Dockerfile
+      network: host
+      args:
+        - INCLUDE_VOSK=${INCLUDE_VOSK:-true}
+        - INCLUDE_SHERPA=${INCLUDE_SHERPA:-true}
+        - INCLUDE_FASTER_WHISPER=${INCLUDE_FASTER_WHISPER:-false}
+        - INCLUDE_WHISPER_CPP=${INCLUDE_WHISPER_CPP:-false}
+        - INCLUDE_TONE=${INCLUDE_TONE:-false}
+        - INCLUDE_PIPER=${INCLUDE_PIPER:-true}
+        - INCLUDE_KOKORO=${INCLUDE_KOKORO:-true}
+        - INCLUDE_MELOTTS=${INCLUDE_MELOTTS:-false}
+        - INCLUDE_SILERO=${INCLUDE_SILERO:-false}
+        - INCLUDE_LLAMA=${INCLUDE_LLAMA:-true}
+        - INCLUDE_KROKO_EMBEDDED=${INCLUDE_KROKO_EMBEDDED:-false}
+    container_name: local_ai_server
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+    logging: *log-rotation
+
+volumes:
+  pgdata:
+  backups:

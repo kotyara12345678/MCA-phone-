@@ -1,0 +1,37 @@
+[package]
+name = "voice-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Realtime voice layer: sessions, audio, VAD, STT/TTS, barge-in"
+
+[[bin]]
+name = "voice-service"
+path = "src/main.rs"
+
+[dependencies]
+mca-core.workspace = true
+mca-proto.workspace = true
+mca-testing.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64 = "0.22"
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+ai-service.workspace = true

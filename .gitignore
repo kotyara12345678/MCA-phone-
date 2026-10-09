@@ -1,0 +1,20 @@
+# Secrets — real values live only in prod/.env, delivered by CI (gh secret),
+# never in git. Everything here is a PUBLIC repo.
+prod/.env
+local/.env
+ava/.env
+.env
+
+# Build & runtime artifacts
+local/target/
+.freebuff/
+prod/data/
+prod/models/
+prod/asterisk_media/
+**/__pycache__/
+*.pyc
+node_modules/
+coverage/
+*.log
+.DS_Store
+Thumbs.db
