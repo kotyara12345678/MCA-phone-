@@ -60,7 +60,7 @@ services:
       # Voice channel requires nothing more than the base API. Mail gates are
       # kept off unless this host is also the email responder.
       MAIL_MODE: ${MAIL_MODE:-read_only}
-      EMAIL_MODE: ${EMAIL_MODE:-manual}
+      EMAIL_MODE: ${EMAIL_MODE:-review}
       EMAIL_AUTO_SEND: ${EMAIL_AUTO_SEND:-false}
       SEND_MANAGER_CARD: ${SEND_MANAGER_CARD:-false}
       BACKUP_ENABLED: ${BACKUP_ENABLED:-false}
