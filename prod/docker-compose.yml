@@ -9,7 +9,7 @@
 #      telephony path (ARI + AudioSocket to Asterisk) needs loopback.
 #
 # Operator notes:
-#   - AVA sources come from ${AVA_REPO} (default ../../ava — the copy vendored
+#   - AVA sources come from ${AVA_REPO} (default ../ava — the copy vendored
 #     into this repository).
 #   - MCA-Mail sources come from ${MCA_MAIL_REPO} (default: the sibling
 #     checkout used to build this file).
@@ -75,7 +75,7 @@ services:
     image: asterisk-ai-voice-agent-ai-engine:latest
     pull_policy: build
     build:
-      context: ${AVA_REPO:-../../ava}
+      context: ${AVA_REPO:-../ava}
       dockerfile: Dockerfile
       network: host
       args:
@@ -109,7 +109,7 @@ services:
     image: asterisk-ai-voice-agent-local-ai-server:latest
     pull_policy: build
     build:
-      context: ${AVA_REPO:-../../ava}/local_ai_server
+      context: ${AVA_REPO:-../ava}/local_ai_server
       dockerfile: Dockerfile
       network: host
       args:
