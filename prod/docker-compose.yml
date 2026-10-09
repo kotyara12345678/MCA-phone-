@@ -46,6 +46,7 @@ services:
         max-file: "5"
 
   mca-mail:
+    image: ghcr.io/kotyara12345678/mca-mail:latest
     build:
       context: ${MCA_MAIL_REPO:-../../MCA-Mail}
     depends_on:
@@ -72,8 +73,7 @@ services:
     logging: *log-rotation
 
   ai_engine:
-    image: asterisk-ai-voice-agent-ai-engine:latest
-    pull_policy: build
+    image: ghcr.io/kotyara12345678/mca-ava-engine:latest
     build:
       context: ${AVA_REPO:-../ava}
       dockerfile: Dockerfile
@@ -106,8 +106,7 @@ services:
     logging: *log-rotation
 
   local_ai_server:
-    image: asterisk-ai-voice-agent-local-ai-server:latest
-    pull_policy: build
+    image: ghcr.io/kotyara12345678/mca-ava-local-ai:latest
     build:
       context: ${AVA_REPO:-../ava}/local_ai_server
       dockerfile: Dockerfile
