@@ -55,7 +55,10 @@ services:
     env_file:
       - .env
     environment:
-      APP_ENV: production
+      # Voice host ships MAIL_PROVIDER=mock (no real mailbox here) and the
+      # production guard refuses mock, so APP_ENV comes from .env; a host that
+      # IS the email responder sets APP_ENV=production with real IMAP settings.
+      APP_ENV: ${APP_ENV:-production}
       DATABASE_URL: postgres://mca:${POSTGRES_PASSWORD:-mca}@postgres:5432/mca_mail
       # Voice channel requires nothing more than the base API. Mail gates are
       # kept off unless this host is also the email responder.
