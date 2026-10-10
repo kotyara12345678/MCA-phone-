@@ -148,16 +148,23 @@
 
 ## 8. Осталось для прода (операционные шаги)
 
-1. **Asterisk**: ARI-пользователь (Host: 127.0.0.1, port: 8088); включить AudioSocket-расширение (`chan_audio_socket`/`res_socket_ais`); dialplan: попадание в вызов через ARI с `AI_PROVIDER` на контекст `aava`; внутренний номер менеджера `6000` (SIP/6000), transfer в `tools.extensions`.
-2. **Ключи провайдеров в `.env`**: `POLZA_API_KEY` уже проставлен локально (проверен живыми запросами); на VPS — перенести значение. Прочие ключи (`OPENAI_API_KEY`, `ELEVENLABS_API_KEY`, …) нужны только при смене pipeline с Polza. Локальные STT/TTS (`local_stt`) остаются как fallback и в `mca_hybrid` не участвуют.
-3. **Сервер mca-mail**: `docker compose build && up -d` в `prod/`; выпустить API-ключ оператора: `docker compose exec mca-mail mca-mail api-key create <name> operator` → в `MCA_API_KEY`.
-   - **Единый стек (этап 3)**: из корня `MCA-Workspace` — `cp .env.example .env`, затем `docker compose up -d postgres mca-mail` (без AVA) или `docker compose up -d` (с AVA), `--profile local-ai` добавляет local_ai_server. Общий PostgreSQL вместо двух экземпляров; gates (email/backup режимы) задаются корневым `.env`, секреты остаются в `MCA-Mail/.env` и `MCA-phone/prod/.env`. Независимые запуски каждого приложения по-прежнему работают.
-4. (Опционально) Admin UI AVA для мониторинга; reverse-proxy/TLS перед 8080, если доступ не через SSH-туннель. Ожидаемо: warning `Active pipeline validation FAILED` на старте ai_engine (GET-пробы Polza отдают 404) — звонки это не блокирует, см. §1.1.
-5. Проверить боевым звонком: восстановление лида по номеру, сбор фактов, квалификация, handoff менеджеру; в call history — `summary_provider=openai_llm`, `summary_status=ok`.
+Голосовой стек **развёрнут и проверен сквозными SIP-звонками** (мини-SIP-клиент с сервера: INVITE 9999 → Stasis → pre-call `mca_ensure_lead` 200 → TTS-приветствие через Polza дошло абоненту (≈7 с RTP) → post-call `mca_finish_call` 200 → транскрипт/summary в PostgreSQL):
+
+- Asterisk 20.6 (apt) на сервере: ARI 127.0.0.1:8088, SIP 0.0.0.0:5060, RTP 10000-20000; dialplan `from-internal`: 9999 = Stasis(mca-phone-voice-agent) c `Set(AI_AGENT=mca)`, 6000 = менеджер; `from-trunk` готов для боевого транка. Тестовые ext: 7000/6000.
+- ai_engine (host network) подключён к ARI (`ari_connected: true`); `audiosocket.format: slin` (серверный AudioSocket шлёт только signed-linear; `ulaw`-outbound отвергается — было исправлено); контекст `mca` в `contexts` yaml обязателен — без него движок пропускает pre-call tools и не резолвит in-call tools (`context_name` пустой → `ctx_config is None`).
+- `MCA_API_KEY` = `voice-engine` (операторский ключ в БД mca-mail; `MINT: docker exec mca-phone-mca-mail-1 /app/mca-mail api-key create --name voice-engine --role operator`). Значение держать синхронизированным: локальный `prod/.env` → секрет `PROD_ENV` (оба репо) → сервер (деплой перезаписывает `.env` из PROD_ENV!). `gh secret set` с `-f` может молча не обновляться — проверять `gh secret list` по timestamp.
+- mca-mail принимает AVA-transcript в формате `role`/`content` (serde-алиасы на `direction`/`body`; маппинг `user→inbound`, `assistant→outbound` на сервере).
+- Входящие RTP от «абонента» в тестах были тишиной (`media_rx_confirmed: false` — ожидаемо для тишины); STT/диалог проверяется реальной речью.
+
+Осталось:
+
+1. **Тест реальной речью**: софтфон (Zoiper и т.п.) → регистрация ext 7000 на `178.212.15.6:5060` (пароль в `.env`/pjsip.conf), дозвон 9999; открыть/настроить на файрволе UDP 5060 + RTP 10000-20000 (риск SIP-фрод — ограничить по IP). Проверить: распознавание речи, инструменты LLM (`mca_get_requirements` и др.), квалификацию, handoff.
+2. **SIP-транк для боевых входящих номеров**: контекст `from-trunk` и `Set(AI_AGENT=mca)` уже в dialplan; нужен аккаунт телепровайдера (операционный шаг).
+3. (Опционально) Admin UI AVA для мониторинга; reverse-proxy/TLS перед 8080, если доступ не через SSH-туннель. Ожидаемо: warning `Active pipeline validation FAILED` на старте ai_engine (GET-пробы Polza отдают 404) — звонки это не блокирует, см. §1.1.
 
 ## 9. Учётные данные и секреты
 
-- Никаких секретов в yaml/исходниках: `prod/.env.example` — только плейсхолдеры. **`prod/.env` содержит реальный `POLZA_API_KEY`** — создаётся/держится локально, в git не попадает (MCA-phone сейчас не git-репозиторий; при инициализации добавьте `prod/.env` в `.gitignore`).
+- Никаких секретов в yaml/исходниках: `prod/.env.example` — только плейсхолдеры. **`prod/.env` содержит реальные секреты** — создаётся/держится локально, в git не попадает (`.gitignore`); зеркало для деплоя — GitHub-секрет `PROD_ENV` (оба репо).
 - API-ключ mca-mail (роль operator/manager) задаётся в `MCA_API_KEY`; `MCA_MANAGER_KEY=mca_manager` (allowlist на сервере); `POSTGRES_PASSWORD` и `JWT_SECRET` — свои.
 - Порт 8080 опубликован на 127.0.0.1; Postgres — только внутри стека (127.0.0.1:5432).
 - `X-API-Key` в инструментах AVA подставляется из `.env` на этапе загрузки конфига (`${ENV}`-экспansion до YAML-парсинга); ключи Polza в yaml только как `${POLZA_API_KEY:-}`.
