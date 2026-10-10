@@ -25,7 +25,9 @@ asterisk:
 # AudioSocket, not file-based: works without shared storage with Asterisk.
 audio_transport: audiosocket
 audiosocket:
-  format: ulaw
+  # AudioSocket server sends signed-linear only (ulaw outbound is refused);
+  # the engine originates c(slin) regardless of this setting.
+  format: slin
   host: 127.0.0.1
   port: 8090
   # Set when the AI engine sits behind NAT/VPN relative to Asterisk:
@@ -68,7 +70,22 @@ no_input:
 
 on_provider_failure: announce_hangup
 provider_failure_prompt: sorry-youre-having-problems
-contexts: {}
+# Bound via the AI_AGENT channel variable set in the Asterisk dialplan
+# (Set(AI_AGENT=mca) before Stasis). Without a loaded context the engine skips
+# pre-call tools and resolves zero in-call tools.
+contexts:
+  mca:
+    pipeline: mca_hybrid
+    pre_call_tools:
+      - mca_ensure_lead
+    post_call_tools:
+      - mca_finish_call
+    in_call_http_tools:
+      - mca_get_requirements
+      - mca_save_facts
+      - mca_save_contact
+      - mca_qualify
+      - mca_transfer_to_manager
 
 llm:
   initial_greeting: >-
