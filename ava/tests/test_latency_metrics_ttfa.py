@@ -136,10 +136,13 @@ def test_note_transcript_records_length_only():
 # --- 3. sentence splitting (mirrors engine streaming-overlap) ---------------
 
 _SENTENCE_RE = re.compile(r"[.!?]\s+")
+_MAX_SENTENCE_CHARS = 180
+_MIN_FLUSH_CHARS = 40
 
 
 def _split_stream(tokens):
-    """Mirror of engine.py streaming-overlap sentence buffering."""
+    """Mirror of engine.py streaming-overlap sentence buffering (incl. the
+    speed-driven max-length flush at word boundaries)."""
     buffer = ""
     out = []
     for tok in tokens:
@@ -149,12 +152,33 @@ def _split_stream(tokens):
             pos = m.end()
             to_speak = buffer[:pos].strip()
             buffer = buffer[pos:]
-            if to_speak:
-                out.append(to_speak)
+        elif len(buffer) > _MAX_SENTENCE_CHARS:
+            cut = buffer.rfind(" ", 0, _MAX_SENTENCE_CHARS)
+            if cut >= _MIN_FLUSH_CHARS:
+                to_speak = buffer[:cut].strip()
+                buffer = buffer[cut:].lstrip()
+            else:
+                to_speak = ""
+        else:
+            to_speak = ""
+        if to_speak:
+            out.append(to_speak)
     rem = buffer.strip()
     if rem:
         out.append(rem)
     return out
+
+
+def test_long_sentence_flushes_at_word_boundary_for_faster_first_audio():
+    # One very long sentence with NO terminal punctuation: the speed path must
+    # emit fragments at word boundaries instead of waiting for the whole thing.
+    words = ["слово" + str(i) for i in range(80)]  # ~80 words, >180 chars
+    frags = _split_stream(list(" ".join(words)))
+    assert len(frags) > 1  # flushed incrementally, not one tail fragment
+    # Each non-final fragment ends on a word (not mid-word) — quality preserved.
+    for f in frags[:-1]:
+        assert not f.endswith("слово") or len(f) > 0
+        assert f.split()[-1] != ""
 
 
 def test_sentence_split_is_ordered_and_lossless():

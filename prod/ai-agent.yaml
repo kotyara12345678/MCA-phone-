@@ -227,10 +227,16 @@ providers:
       - llm
     api_key: ${POLZA_API_KEY:-}
     chat_base_url: ${POLZA_LLM_URL:-https://polza.ai/api/v1}
-    # gpt-4.1-mini: fastest first-token on Polza among tools-capable models
-    # (≈1.0-1.5s to first RU sentence). gpt-6-luna was a reasoning model:
-    # ~2.4s+ and post-call summaries returned empty_response.
-    chat_model: openai/gpt-4.1-mini
+    # Measured on the live Polza gateway (bench/bench_ttfa.py, stream=true,
+    # short RU prompts, content-TTFT p50, 2026-10-24):
+    #   google/gemini-2.5-flash-lite  TTFT p50 1.13s  total p50 1.35s  tool 2/2  <-- here
+    #   openai/gpt-4.1-mini          TTFT p50 1.52s  total p50 1.70s  tool 0/2
+    #   deepseek/deepseek-v4.1-flash content TTFT p50 2.39s (reasoning before text)
+    #   openai/gpt-6-luna (reasoning) ~2.4s+, summaries returned empty_response
+    # gemini-2.5-flash-lite is the measured-fastest AND tool-reliable option on
+    # this gateway (needed for mca_* in-call tools). Russian quality is good for
+    # short spoken replies. Fallback: openai/gpt-4.1-mini.
+    chat_model: google/gemini-2.5-flash-lite
     enabled: true
     response_timeout_sec: 15
     tools_enabled: true

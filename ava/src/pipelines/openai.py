@@ -823,8 +823,21 @@ class OpenAILLMAdapter(LLMComponent):
     async def _ensure_session(self) -> None:
         if self._session and not self._session.closed:
             return
-        factory = self._session_factory or aiohttp.ClientSession
-        self._session = factory()
+        if self._session_factory is not None:
+            # Test/injected session — use as-is.
+            self._session = self._session_factory()
+            return
+        # HTTP speed: a single keep-alive connection reused across turns + DNS
+        # cache, so repeat LLM calls to the gateway skip TCP+TLS+DNS setup. This
+        # is the only cloud hop in the pipeline (STT/TTS are local providers).
+        connector = aiohttp.TCPConnector(
+            limit=200,
+            ttl_dns_cache=600,
+            use_dns_cache=True,
+            force_close=False,
+            enable_cleanup_closed=True,
+        )
+        self._session = aiohttp.ClientSession(connector=connector)
 
     def _compose_options(self, runtime_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         runtime_options = runtime_options or {}

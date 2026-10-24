@@ -16947,6 +16947,12 @@ class Engine:
                             tools_configured=bool((llm_options or {}).get("tools")),
                         )
                         _SENTENCE_RE = re.compile(r"[.!?]\s+")
+                        # Speed: never let one very long sentence gate the first audio.
+                        # Once the buffer passes _MAX_SENTENCE_CHARS we flush up to the
+                        # last word boundary (well above a normal spoken phrase, so
+                        # quality and word boundaries are preserved).
+                        _MAX_SENTENCE_CHARS = 180
+                        _MIN_FLUSH_CHARS = 40
                         sentence_buffer = ""
                         full_response_text = ""
                         first_tts_ts: Optional[float] = None
@@ -17067,13 +17073,24 @@ class Engine:
                                     split_pos = match.end()
                                     to_speak = sentence_buffer[:split_pos].strip()
                                     sentence_buffer = sentence_buffer[split_pos:]
+                                elif len(sentence_buffer) > _MAX_SENTENCE_CHARS:
+                                    # Speed: overlong sentence — flush at the last word
+                                    # boundary so TTS starts before it fully completes.
+                                    cut = sentence_buffer.rfind(" ", 0, _MAX_SENTENCE_CHARS)
+                                    if cut >= _MIN_FLUSH_CHARS:
+                                        to_speak = sentence_buffer[:cut].strip()
+                                        sentence_buffer = sentence_buffer[cut:].lstrip()
+                                    else:
+                                        to_speak = ""
+                                else:
+                                    to_speak = ""
 
-                                    if to_speak:
-                                        try:
-                                            get_latency_metrics().mark(call_id, EV_FIRST_SENTENCE)
-                                        except Exception:
-                                            pass
-                                        await _speak(to_speak)
+                                if to_speak:
+                                    try:
+                                        get_latency_metrics().mark(call_id, EV_FIRST_SENTENCE)
+                                    except Exception:
+                                        pass
+                                    await _speak(to_speak)
 
                             # Flush remaining sentence buffer
                             remainder = sentence_buffer.strip()
