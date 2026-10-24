@@ -72,6 +72,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
@@ -80,7 +82,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           port: ${{ secrets.SERVER_PORT }}
-          envs: PROD_ENV
+          envs: PROD_ENV,GITHUB_TOKEN,GITHUB_ACTOR
           script: |
             set -e
             export DEBIAN_FRONTEND=noninteractive
@@ -88,6 +90,9 @@ jobs:
             command -v git >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq git curl)
             command -v docker >/dev/null 2>&1 || (curl -fsSL https://get.docker.com | sh)
             mkdir -p "$ROOT"
+
+            echo '== docker login ghcr.io =='
+            echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
             sync_repo() {
               dir="$1"; url="$2"
