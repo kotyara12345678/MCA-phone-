@@ -128,6 +128,40 @@ jobs:
 
             echo '== runtime env from CI secret =='
             printf '%s\n' "$PROD_ENV" > "$ROOT/MCA-phone/prod/.env"
+            # Pin low-latency local model paths even if PROD_ENV is stale.
+            # Models live under prod/models (host mount into local_ai_server).
+            set_env() {
+              key="$1"; val="$2"
+              if grep -q "^${key}=" "$ROOT/MCA-phone/prod/.env"; then
+                sed -i "s|^${key}=.*|${key}=${val}|" "$ROOT/MCA-phone/prod/.env"
+              else
+                printf '%s=%s\n' "$key" "$val" >> "$ROOT/MCA-phone/prod/.env"
+              fi
+            }
+            set_env LOCAL_STT_BACKEND vosk
+            set_env LOCAL_TTS_BACKEND piper
+            set_env LOCAL_STT_MODEL_PATH /app/models/stt/vosk-model-small-ru-0.22
+            set_env LOCAL_TTS_MODEL_PATH /app/models/tts/ru_RU-irina-medium/ru_RU-irina-medium.onnx
+            set_env LOCAL_TTS_PHRASE_CACHE_ENABLED true
+
+            echo '== ensure local STT/TTS models (idempotent) =='
+            MODELS="$ROOT/MCA-phone/prod/models"
+            mkdir -p "$MODELS/stt" "$MODELS/tts"
+            if [ ! -f "$MODELS/stt/vosk-model-small-ru-0.22/am/final.mdl" ]; then
+              echo 'downloading vosk-model-small-ru-0.22...'
+              curl -fsSL -o /tmp/vosk-ru.zip https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip
+              unzip -qo /tmp/vosk-ru.zip -d "$MODELS/stt"
+              rm -f /tmp/vosk-ru.zip
+            fi
+            PIPER_DIR="$MODELS/tts/ru_RU-irina-medium"
+            if [ ! -f "$PIPER_DIR/ru_RU-irina-medium.onnx" ]; then
+              echo 'downloading Piper ru_RU-irina-medium...'
+              mkdir -p "$PIPER_DIR"
+              curl -fsSL -o "$PIPER_DIR/ru_RU-irina-medium.onnx" \
+                https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx
+              curl -fsSL -o "$PIPER_DIR/ru_RU-irina-medium.onnx.json" \
+                https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx.json
+            fi
 
             cd "$ROOT/MCA-phone"
             echo '== pull prebuilt images =='

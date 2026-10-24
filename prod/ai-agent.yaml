@@ -43,19 +43,40 @@ barge_in:
   cooldown_ms: 500
   post_tts_end_protection_ms: 250
 
+# Latency budget (target: STT-final → first TTS bytes ≤ 1.5s):
+#   local VOSK streaming STT + openai_llm (gpt-4.1-mini, streaming overlap)
+#   + local Piper TTS. Buffers below are tuned for first-audio latency over
+#   underrun safety; raise min_start_ms if callers hear choppy onset.
 streaming:
   sample_rate: 8000
-  jitter_buffer_ms: 100
+  jitter_buffer_ms: 50
   keepalive_interval_ms: 5000
   connection_timeout_ms: 10000
   fallback_timeout_ms: 8000
   chunk_size_ms: 20
-  min_start_ms: 300
-  low_watermark_ms: 200
-  provider_grace_ms: 500
+  min_start_ms: 120
+  greeting_min_start_ms: 40
+  low_watermark_ms: 80
+  provider_grace_ms: 300
+  pipeline_streaming_overlap: true
+  # Instant filler while the LLM is thinking — perceived latency ≈ 0 even
+  # when the first sentence takes >1s (tool-call turns especially).
+  # Keep phrases ULTRA short: AVA drains filler playback before starting the
+  # LLM stream (engine.py), so every extra word adds to total turn time.
+  pipeline_filler_enabled: true
+  pipeline_filler_phrases:
+    - "Да."
+    - "Секундочка."
+    - "Угу."
   logging_level: info
   diag_enable_taps: false
   diag_out_dir: /tmp/ai-engine-taps
+
+# Faster endpointing: ~200ms silence ends the utterance (was ~300ms).
+vad:
+  webrtc_end_silence_frames: 10
+  min_utterance_duration_ms: 600
+  utterance_padding_ms: 80
 
 # Caller inactivity watchdog.
 no_input:
@@ -92,60 +113,47 @@ llm:
     Добрый день! Это компания MCA, отдел грузоперевозок. Подскажите, что вам
     нужно перевезти?
   prompt: >-
-    Ты — голосовой ассистент компании MCA (логистика и грузоперевозки по
-    России и СНГ). Общайся по-русски, кратко и по делу.
+    Ты — голосовой ассистент компании MCA (логистика, грузоперевозки по России
+    и СНГ). Отвечай по-русски, коротко (одно-два предложения), живым голосом.
 
     ОБЯЗАТЕЛЬНО:
-    - В самом начале звонка вызывай mca_get_requirements: если клиент уже
-      звонил, CRM вернёт собранные факты и список asked_questions — это
-      продолжение разговора, а не новый лид.
-    - Список asked_questions в ответе mca_get_requirements — вопросы,
-      которые тебе уже задавали (question) и был ли на них ответ клиента
-      (answered). Вопросы с answered=true закрыты — никогда их не
-      переспрашивай; answered=false ещё без ответа — при необходимости можно
-      уточнить.
-    - Собери проверенные факты о перевозке: компания и ИНН (если называют),
-      описание груза, города забора и доставки, вес/объём/количество мест,
-      даты, тип транспорта, особенности (хрупкий, опасный, негабарит,
-      температурный режим, страхование), контакты.
-    - Записывай каждый принятый факт инструментом mca_save_facts.
-    - Email клиента сохраняй отдельным инструментом mca_save_contact, как
-      только он продиктовал его и ты подтвердил адрес по буквам: без email
-      после звонка нельзя отправить клиенту карточку заказа.
-    - Если чего-то из обязательного не хватает — задавай один вопрос за раз,
-      сверяясь с asked_questions, чтобы не переспрашивать уже закрытое.
-    - Когда данные собраны, вызывай mca_qualify и следуй его ответу.
+    - В начале звонка вызови mca_get_requirements (продолжение разговора, если
+      лид уже есть). Вопросы с answered=true не переспрашивай.
+    - Собери проверенные факты: компания/ИНН, груз, города, вес/объём/кол-во,
+      даты, транспорт, особенности, контакты, email.
+    - Каждый принятый факт сохраняй через mca_save_facts. Email — через
+      mca_save_contact сразу после подтверждения по буквам.
+    - Один вопрос за раз; когда данных достаточно — mca_qualify.
+    - Нет уверенности / просят цену или менеджера — mca_transfer_to_manager.
 
-    ЗАПРЕЩЕНО:
-    - Никогда не называй цены, тарифы, сроки доставки, характеристики техники,
-      таможенные и юридические условия — только менеджер.
-    - Не выдумывай данные компании, ИНН, груза; что клиент не подтвердил —
-    считай неизвестным.
-    - Не завершай звонок без подтверждения клиента.
-    - Не сообщай логины, ключи или внутренние детали системы.
-
-    Если клиент просит цену, условия, конкретного менеджера, обратный звонок
-    либо ты не уверен в ответе — сразу вызывай mca_transfer_to_manager с
-    причиной и приоритетом. Менеджеру передаётся вся история диалога.
+    ЗАПРЕЩЕНО: цены, тарифы, сроки, техника, таможня, юруслуги — только
+    менеджер. Не выдумывай факты. Не завершай звонок без подтверждения.
 
 pipelines:
-  # Russian-first default, all three stages through the Polza gateway:
-  #   STT: openai_stt — whisper-large-v3-turbo, utterance-level REST
-  #        transcription (non-streaming; language=ru is sent per request).
-  #   LLM: openai_llm — openai/gpt-6-luna (reasoning model: max_tokens leaves
-  #        headroom so reasoning tokens never eat the visible answer).
-  #   TTS: openai_tts — google/gemini-3.8-flash-tts (wav, voice from .env).
+  # Low-latency hybrid for MCA voice (target ≤1.5s STT-final → first audio):
+  #   STT: local_stt — Vosk RU, streaming over WebSocket, no cloud RTT.
+  #   LLM: openai_llm — openai/gpt-4.1-mini (fastest measured on Polza:
+  #        ~1.0-1.5s to first sentence; streaming overlap starts TTS early).
+  #   TTS: local_tts — Piper ru_RU-irina, co-located, ~0.4-0.6s per sentence.
   mca_hybrid:
-    stt: openai_stt
+    stt: local_stt
     llm: openai_llm
-    tts: openai_tts
+    tts: local_tts
     options:
       stt:
-        language: ru
-        request_timeout_sec: 20
+        # Engine forces streaming for local_stt; chunk_ms is the feed grain.
+        chunk_ms: 160
+        request_timeout_sec: 10
       llm:
-        temperature: 0.4
-        max_tokens: 1024
+        temperature: 0.3
+        # Short spoken replies only — caps tail latency of the sentence that
+        # triggers TTS and keeps tool-call turns from ballooning.
+        max_tokens: 160
+        # Tighten STT→LLM handoff (defaults 2.0s / 3 words / 12 chars).
+        aggregation_timeout_sec: 0.6
+        aggregation_min_words: 2
+        aggregation_min_chars: 6
+        request_timeout_sec: 12
       tts:
         format:
           encoding: ulaw
@@ -175,14 +183,13 @@ providers:
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
       - stt
-    chunk_ms: ${LOCAL_WS_CHUNK_MS:=320}
+    chunk_ms: ${LOCAL_WS_CHUNK_MS:=160}
     connect_timeout_sec: ${LOCAL_WS_CONNECT_TIMEOUT:=2.0}
     enabled: true
     response_timeout_sec: ${LOCAL_WS_RESPONSE_TIMEOUT:=10.0}
     stt_backend: vosk
-    # Russian telephony: point this at a Russian model, e.g.
-    # models/stt/vosk-model-ru-0.42 (download into ./models).
-    stt_model: ${LOCAL_STT_MODEL_PATH:-models/stt/vosk-model-en-us-0.22}
+    # Russian telephony model (prod/models/stt/, mounted into local_ai_server).
+    stt_model: ${LOCAL_STT_MODEL_PATH:-models/stt/vosk-model-small-ru-0.22}
     type: local
     ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
 
@@ -190,9 +197,11 @@ providers:
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
       - tts
-    enabled: false
+    enabled: true
     response_timeout_sec: ${LOCAL_WS_RESPONSE_TIMEOUT:=10.0}
-    tts_voice: ${LOCAL_TTS_MODEL_PATH:-models/tts/en_US-lessac-medium.onnx}
+    # Piper ONNX (prod/models/tts/ru_RU-irina-medium/). The local server loads
+    # LOCAL_TTS_MODEL_PATH at startup; tts_voice is the adapter-side hint.
+    tts_voice: ${LOCAL_TTS_MODEL_PATH:-/app/models/tts/ru_RU-irina-medium/ru_RU-irina-medium.onnx}
     type: local
     ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
 
@@ -218,10 +227,12 @@ providers:
       - llm
     api_key: ${POLZA_API_KEY:-}
     chat_base_url: ${POLZA_LLM_URL:-https://polza.ai/api/v1}
-    chat_model: openai/gpt-6-luna
+    # gpt-4.1-mini: fastest first-token on Polza among tools-capable models
+    # (≈1.0-1.5s to first RU sentence). gpt-6-luna was a reasoning model:
+    # ~2.4s+ and post-call summaries returned empty_response.
+    chat_model: openai/gpt-4.1-mini
     enabled: true
-    # Reasoning model: budget for reasoning tokens + a short RU answer.
-    response_timeout_sec: 30
+    response_timeout_sec: 15
     tools_enabled: true
     type: openai
 
@@ -494,7 +505,7 @@ tools:
     is_global: true
     generate_summary: true
     # Route the summary through the configured openai_llm component (Polza
-    # openai/gpt-6-luna). Without summary_provider AVA falls back to a legacy
+    # openai/gpt-4.1-mini). Without summary_provider AVA falls back to a legacy
     # path that needs OPENAI_API_KEY and hardcodes gpt-4o-mini.
     summary_provider: openai_llm
     summary_max_words: 100

@@ -186,3 +186,50 @@
 - Приоритет опций: runtime → pipeline `options` → provider (`_compose_options` каждого адаптера) — поэтому в `pipelines.mca_hybrid.options.llm` убраны `base_url`/`model` (иначе перебили бы Polza).
 - Guard-ы адаптеров openai.py: STT :187-201 (`"/"`/`whisper-large-` → откат на provider `stt_model`), TTS :973-982 (`"/"` → откат на provider `tts_model`), LLM :833-847 (только groq-host/`llama-`/`mixtral`); `validate_connectivity` LLM :438-440 принимает модели с префиксом `o`/`gpt-`/`chatgpt` — `openai/gpt-6-luna` проходит.
 - Стартовая проверка connectivy (`_validate_pipeline_connectivity`): GET на endpoint'ы с Bearer; 404 → `healthy: false`, но **pipeline не выключается** (комментарий orchestrator.py:361-376); гейт готовности используется только в health/status-снимках (engine.py:23038-23049).
+## 11. Latency rev 2026-10-24 (цель ≤1.5s)
+
+Проблема: `openai/gpt-6-luna` (reasoning, ~2.4s+) + `google/gemini-3.8-flash-tts`
+через Polza (буферизуется целиком, 3.6–9.3s) + non-streaming `openai_stt`
+(REST-POST каждые 160ms) — суммарно 6–13s от конца речи до первого байта TTS.
+
+### Что сделано
+
+| Этап | Было | Стало |
+|---|---|---|
+| STT | `openai_stt` whisper REST | **`local_stt` Vosk RU** (`vosk-model-small-ru-0.22`, streaming WS, ≈5× realtime) |
+| LLM | `openai/gpt-6-luna` | **`openai/gpt-4.1-mini`** (Polza; first token ≈1.0–1.3s, streaming overlap включён по умолчанию) |
+| TTS | `openai_tts` gemini-flash-tts | **`local_tts` Piper `ru_RU-irina-medium`** (warm ≈220–450ms на предложение) |
+| VAD | end_silence 15 frames (~300ms) | **10 frames (~200ms)** |
+| Буферы | min_start 300 / jitter 100 | **min_start 120 / jitter 50 / low_watermark 80** |
+| STT→LLM | aggregation 2.0s / 3 words | **0.6s / 2 words** |
+| Filler | off | **on**, ультра-короткие фразы («Да.», «Секундочка.») |
+| Prompt | длинный | сжатый (ниже TTFT на Polza) |
+
+### Ожидаемый бюджет (streaming overlap: TTS стартует по первому предложению LLM)
+
+- STT-final → LLM first sentence: **≈1.0–1.3s**
+- TTS первого предложения: **≈0.2–0.45s**
+- min_start warm-up: **0.12s**
+- Итого STT-final → first audio: **≈1.4–1.9s** (шум Polza)
+- **Filler** даёт первый звук ≈0.2–0.4s после STT-final (метрика `ai_agent_turn_response_seconds`),
+  затем drain filler → overlap LLM‖TTS.
+
+### Модели (host mount `prod/models/`, gitignored, качаются deploy-шагом)
+
+- STT: `prod/models/stt/vosk-model-small-ru-0.22`
+- TTS: `prod/models/tts/ru_RU-irina-medium/ru_RU-irina-medium.onnx`
+- `LOCAL_STT_MODEL_PATH` / `LOCAL_TTS_MODEL_PATH` пиннятся в deploy.yml даже при устаревшем `PROD_ENV`.
+
+### Как мерить
+
+`GET http://127.0.0.1:15000/metrics` → гистограммы
+`ai_agent_stt_to_tts_seconds` и `ai_agent_turn_response_seconds`;
+`call_records.avg_turn_latency_ms` / `max_turn_latency_ms`.
+
+### Ограничения / следующие шаги
+
+- Polza «холодный» gateway: first token гуляет 0.9–1.9s. Для жёсткого p95 <1.5s
+  без filler — нужен более быстрый LLM (Groq/key) или кэш-warm keep-alive.
+- Tool-call ход = LLM1 (tool_calls) → HTTP → LLM2 → TTS: суммарно ~2.5–3s;
+  filler маскирует первый звук.
+- Если слышны обрывы при старте — поднять `streaming.min_start_ms` до 200.
