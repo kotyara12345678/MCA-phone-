@@ -103,6 +103,13 @@ from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile, apply_context_voice
 from .core.models import CallSession
 from .core.call_diagnostics import build_call_diagnostics_snapshot
+from .core.latency_metrics import (
+    get_latency_metrics,
+    EV_SPEECH_END,
+    EV_FIRST_SENTENCE,
+    EV_FIRST_FRAME_SENT,
+    EV_TURN_END,
+)
 from .core.no_input_watchdog import NoInputPolicy, NoInputWatchdog
 from .core.outbound_schedule import normalize_outbound_daily_window
 from .core.outbound_store import get_outbound_store
@@ -16654,6 +16661,13 @@ class Engine:
                 async def process_audio(audio_chunk: bytes) -> None:
                     transcript = ""
                     try:
+                        # TTFA instrumentation: monotonic "utterance ready, about to
+                        # send to STT" marker (best-available end-of-speech proxy for
+                        # the batch STT path). First-wins inside the metrics collector.
+                        get_latency_metrics().mark(call_id, EV_SPEECH_END)
+                    except Exception:
+                        pass
+                    try:
                         transcript = await pipeline.stt_adapter.transcribe(
                             call_id,
                             audio_chunk,
@@ -16980,6 +16994,10 @@ class Engine:
                                     turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                     session.turn_latencies_ms.append(turn_latency_ms)
                                     try:
+                                        get_latency_metrics().mark(call_id, EV_FIRST_FRAME_SENT)
+                                    except Exception:
+                                        pass
+                                    try:
                                         if t_start is not None:
                                             _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
                                                 max(0.0, first_tts_ts - t_start)
@@ -17051,6 +17069,10 @@ class Engine:
                                     sentence_buffer = sentence_buffer[split_pos:]
 
                                     if to_speak:
+                                        try:
+                                            get_latency_metrics().mark(call_id, EV_FIRST_SENTENCE)
+                                        except Exception:
+                                            pass
                                         await _speak(to_speak)
 
                             # Flush remaining sentence buffer
@@ -17073,6 +17095,13 @@ class Engine:
                                     _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
                                         max(0.0, time.time() - t_start)
                                     )
+                            except Exception:
+                                pass
+
+                            try:
+                                _latm = get_latency_metrics()
+                                _latm.mark(call_id, EV_TURN_END)
+                                _latm.finish_turn(call_id)
                             except Exception:
                                 pass
 

@@ -32,6 +32,15 @@ from ..config import AppConfig, OpenAIProviderConfig
 from ..logging_config import get_logger
 from .base import LLMComponent, STTComponent, TTSComponent, LLMResponse
 from ..tools.registry import tool_registry
+from ..core.latency_metrics import (
+    get_latency_metrics,
+    EV_STT_SENT,
+    EV_STT_FINAL,
+    EV_LLM_START,
+    EV_LLM_FIRST_TOKEN,
+    EV_TTS_START,
+    EV_TTS_FIRST_BYTE,
+)
 
 logger = get_logger(__name__)
 
@@ -291,6 +300,12 @@ class OpenAISTTAdapter(STTComponent):
                     )
                 return resp.status, raw, body_text, latency_ms
 
+        _metrics = get_latency_metrics()
+        try:
+            _metrics.mark(call_id, EV_STT_SENT)
+            _metrics.set_model(call_id, "stt", str(merged.get("model") or ""))
+        except Exception:
+            pass
         status, body, body_text, latency_ms = await _post(str(merged["model"]))
         if status >= 400:
             body_lower = (body_text or "").lower()
@@ -309,9 +324,17 @@ class OpenAISTTAdapter(STTComponent):
                 merged["model"] = fallback_model
 
         if status >= 400:
+            try:
+                get_latency_metrics().record_error("stt")
+            except Exception:
+                pass
             raise RuntimeError(f"OpenAI STT request failed (status {status}): {(body_text or '')[:256]}")
 
         transcript = self._parse_transcript(body, response_format=merged.get("response_format") or "json")
+        try:
+            get_latency_metrics().mark(call_id, EV_STT_FINAL)
+        except Exception:
+            pass
         logger.info(
             "OpenAI STT transcript received",
             call_id=call_id,
@@ -668,6 +691,14 @@ class OpenAILLMAdapter(LLMComponent):
         if not merged["api_key"]:
             raise RuntimeError("OpenAI LLM requires an API key")
 
+        _metrics = get_latency_metrics()
+        _first_token_seen = False
+        try:
+            _metrics.mark(call_id, EV_LLM_START)
+            _metrics.set_model(call_id, "llm", str(merged.get("chat_model") or ""))
+        except Exception:
+            pass
+
         # Realtime transport doesn't support Chat Completions streaming
         if bool(merged.get("use_realtime")):
             result = await self.generate(call_id, transcript, context, options)
@@ -721,6 +752,12 @@ class OpenAILLMAdapter(LLMComponent):
                             delta = choices[0].get("delta", {})
                             content = delta.get("content")
                             if content:
+                                if not _first_token_seen:
+                                    _first_token_seen = True
+                                    try:
+                                        _metrics.mark(call_id, EV_LLM_FIRST_TOKEN)
+                                    except Exception:
+                                        pass
                                 yield content
 
                             # Accumulate tool call deltas
@@ -766,6 +803,10 @@ class OpenAILLMAdapter(LLMComponent):
                 )
 
         except asyncio.TimeoutError as e:
+            try:
+                get_latency_metrics().record_timeout("llm")
+            except Exception:
+                pass
             logger.warning(
                 "OpenAI streaming timed out; falling back to serial path",
                 call_id=call_id,
@@ -773,6 +814,10 @@ class OpenAILLMAdapter(LLMComponent):
                 error=str(e),
             )
         except aiohttp.ClientError as e:
+            try:
+                get_latency_metrics().record_error("llm")
+            except Exception:
+                pass
             logger.error("OpenAI streaming connection error", call_id=call_id, error=str(e))
 
     async def _ensure_session(self) -> None:
@@ -967,6 +1012,12 @@ class OpenAITTSAdapter(TTSComponent):
         if not api_key:
             raise RuntimeError("OpenAI TTS requires an API key")
 
+        _metrics = get_latency_metrics()
+        try:
+            _metrics.mark(call_id, EV_TTS_START)
+        except Exception:
+            pass
+
         # OpenAI audio.speech expects a small enum set for model/voice/response_format. We avoid hard-failing
         # on unknown values (to reduce drift with upstream), but we keep "safe fallbacks" + retries for the
         # common case where a pipeline TTS provider is swapped and stale options remain (e.g., Groq model/voice).
@@ -1031,6 +1082,10 @@ class OpenAITTSAdapter(TTSComponent):
             voice=payload["voice"],
             text_preview=text[:64],
         )
+        try:
+            _metrics.set_model(call_id, "tts", str(payload["model"]))
+        except Exception:
+            pass
 
         async def _post_tts(req_payload: Dict[str, Any]) -> tuple[int, bytes, str]:
             async with self._session.post(url, json=req_payload, headers=headers, timeout=merged["timeout_sec"]) as resp:
@@ -1075,6 +1130,10 @@ class OpenAITTSAdapter(TTSComponent):
                     status=status,
                     body_preview=(body or "")[:128],
                 )
+                try:
+                    get_latency_metrics().record_error("tts")
+                except Exception:
+                    pass
                 raise RuntimeError(
                     f"OpenAI TTS request failed (status {status}): {(body or '')[:256]}"
                 )
@@ -1098,6 +1157,7 @@ class OpenAITTSAdapter(TTSComponent):
         )
 
         chunk_ms = int(merged.get("chunk_size_ms", self._chunk_size_ms))
+        _first_byte = True
         for chunk in _chunk_audio(
             converted,
             merged["target_format"]["encoding"],
@@ -1105,6 +1165,12 @@ class OpenAITTSAdapter(TTSComponent):
             chunk_ms,
         ):
             if chunk:
+                if _first_byte:
+                    _first_byte = False
+                    try:
+                        _metrics.mark(call_id, EV_TTS_FIRST_BYTE)
+                    except Exception:
+                        pass
                 yield chunk
 
     async def _ensure_session(self) -> None:
