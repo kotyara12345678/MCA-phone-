@@ -381,6 +381,15 @@ def _ts_msg(role: str, content, **extra) -> dict:
 _LLM_MSG_KEYS = {"role", "content", "name", "tool_calls", "tool_call_id"}
 
 
+# Tools whose execution must wait until the caller has heard the spoken
+# response (they end or hand off the call). Read-only lookups and fact saves
+# must NOT pause the turn: the audio keeps playing from the stream queue, so
+# executing them immediately costs nothing and saves seconds of dead air.
+_TERMINAL_TOOL_PAUSE_NAMES = frozenset(
+    {"hangup_call", "blind_transfer", "live_agent_transfer", "transfer_call"}
+)
+
+
 def _sanitize_for_llm(history: list) -> list:
     """Strip non-standard keys (e.g. timestamp) before sending to LLM adapters."""
     sanitized = []
@@ -16161,6 +16170,19 @@ class Engine:
             # Inject context prompt into LLM options with fallback chain
             # Fallback chain: AI_CONTEXT → pipeline default → global llm_config
             llm_options = pipeline.llm_options or {}
+            # ── Latency: prefetch declared CRM lookups before the first turn ──
+            # Flows that mandate a lookup tool ("call mca_get_requirements at
+            # the start of the call") otherwise cost two sequential LLM
+            # round-trips before any audio. Fetching the data here, before the
+            # system prompt is composed, lets the model answer in one round.
+            try:
+                llm_options = await self._prefetch_pipeline_prompt_tools(
+                    call_id, session, llm_options
+                )
+            except Exception:
+                logger.debug(
+                    "Pipeline prompt prefetch failed", call_id=call_id, exc_info=True
+                )
             prompt_source = "pipeline_default"
             try:
                 # Priority 1: Check if context has a custom prompt
@@ -16840,40 +16862,87 @@ class Engine:
                     # System prompt only in first turn (when history is empty)
                     context_for_llm = {"prior_messages": _sanitize_for_llm(conversation_history)}
 
-                    # ── Pipeline filler audio: instant ack before LLM ──
-                    # Uses fire-and-forget: synthesize filler, push all chunks, send
-                    # EOS sentinel, then stop_streaming_playback so the slot is free
-                    # for the real LLM→TTS streaming overlap that follows.
+                    # ── Pipeline filler audio: instant ack while the LLM thinks ──
+                    # Speed: the filler used to be synthesized AND fully played back
+                    # before the LLM request even started, so every turn paid the
+                    # filler duration on top of the LLM time-to-first-token. It now
+                    # runs as a background task: the LLM stream starts immediately and
+                    # the phrase simply covers its latency. The playback slot is a
+                    # single-per-call resource, so the filler is cut (no drain) the
+                    # moment the first real audio chunk is ready, and drained when the
+                    # turn produced no audio at all.
                     _streaming_cfg = getattr(self.config, "streaming", None)
                     _filler_enabled = getattr(_streaming_cfg, "pipeline_filler_enabled", False) if _streaming_cfg else False
+                    _filler_task: Optional[asyncio.Task] = None
+                    _filler_active = False
+
+                    async def _end_filler(*, drain: bool) -> None:
+                        """Release the call's single streaming playback slot from the filler."""
+                        nonlocal _filler_active, _filler_task
+                        task, _filler_task = _filler_task, None
+                        if task is not None and not task.done():
+                            if drain:
+                                # Bounded wait: an unresponsive TTS must never stall the turn.
+                                try:
+                                    await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+                                except asyncio.TimeoutError:
+                                    task.cancel()
+                                    with contextlib.suppress(BaseException):
+                                        await task
+                                except asyncio.CancelledError:
+                                    pass
+                                except Exception:
+                                    logger.debug("Pipeline filler drain failed", call_id=call_id, exc_info=True)
+                            else:
+                                task.cancel()
+                                with contextlib.suppress(BaseException):
+                                    await task
+                        if not _filler_active:
+                            return
+                        _filler_active = False
+                        try:
+                            await self.streaming_playback_manager.stop_streaming_playback(call_id, drain=drain)
+                        except Exception:
+                            logger.debug("Pipeline filler stop failed", call_id=call_id, exc_info=True)
+                        # Backdate tts_ended_ts so the post_tts_end_protection_ms window has
+                        # already expired. This avoids a barge-in dead zone between the
+                        # filler and the real response while keeping the echo protection
+                        # mechanism intact for future TTS emissions.
+                        _post_guard = getattr(self.config, "barge_in", None)
+                        _post_ms = getattr(_post_guard, "post_tts_end_protection_ms", 250) if _post_guard else 250
+                        session.tts_ended_ts = time.time() - (_post_ms / 1000.0) - 0.01
+
                     if _filler_enabled and pipeline.tts_adapter:
                         _filler_phrases = getattr(_streaming_cfg, "pipeline_filler_phrases", None) or []
                         if _filler_phrases:
                             import random as _rnd
                             _filler_text = _rnd.choice(_filler_phrases)
-                            try:
-                                _filler_q: asyncio.Queue = asyncio.Queue(maxsize=64)
-                                _old_pn = getattr(session, "provider_name", None)
-                                self._assign_session_provider(session, "pipeline")
 
-                                _tts_fmt = (pipeline.tts_options or {}).get("format")
-                                if not isinstance(_tts_fmt, dict):
-                                    _tts_fmt = (pipeline.tts_options or {}).get("target_format")
-                                if not isinstance(_tts_fmt, dict):
-                                    _tts_fmt = {}
-                                _filler_enc = str(_tts_fmt.get("encoding") or _tts_fmt.get("format") or "mulaw")
+                            async def _run_filler() -> None:
+                                nonlocal _filler_active
                                 try:
-                                    _filler_rate = int(_tts_fmt.get("sample_rate") or _tts_fmt.get("sample_rate_hz") or 8000)
-                                except Exception:
-                                    _filler_rate = 8000
+                                    _filler_q: asyncio.Queue = asyncio.Queue(maxsize=64)
 
-                                _filler_sid = await self.streaming_playback_manager.start_streaming_playback(
-                                    call_id, _filler_q,
-                                    playback_type="pipeline-tts-filler",
-                                    source_encoding=_filler_enc,
-                                    source_sample_rate=_filler_rate,
-                                )
-                                if _filler_sid:
+                                    _tts_fmt = (pipeline.tts_options or {}).get("format")
+                                    if not isinstance(_tts_fmt, dict):
+                                        _tts_fmt = (pipeline.tts_options or {}).get("target_format")
+                                    if not isinstance(_tts_fmt, dict):
+                                        _tts_fmt = {}
+                                    _filler_enc = str(_tts_fmt.get("encoding") or _tts_fmt.get("format") or "mulaw")
+                                    try:
+                                        _filler_rate = int(_tts_fmt.get("sample_rate") or _tts_fmt.get("sample_rate_hz") or 8000)
+                                    except Exception:
+                                        _filler_rate = 8000
+
+                                    _filler_sid = await self.streaming_playback_manager.start_streaming_playback(
+                                        call_id, _filler_q,
+                                        playback_type="pipeline-tts-filler",
+                                        source_encoding=_filler_enc,
+                                        source_sample_rate=_filler_rate,
+                                    )
+                                    if not _filler_sid:
+                                        return
+                                    _filler_active = True
                                     async for _fc in pipeline.tts_adapter.synthesize(call_id, _filler_text, pipeline.tts_options):
                                         if _fc:
                                             await _filler_q.put(_fc)
@@ -16886,24 +16955,24 @@ class Engine:
                                         call_id=call_id,
                                         phrase=_filler_text,
                                     )
-                                    # Wait for filler playback to finish, then release the
-                                    # streaming slot so the real LLM→TTS overlap can use it.
+                                    # Natural end: let the phrase finish, then release the
+                                    # streaming slot for the real LLM→TTS overlap.
                                     await self.streaming_playback_manager.stop_streaming_playback(call_id, drain=True)
-                                    # Backdate tts_ended_ts so the post_tts_end_protection_ms
-                                    # window has already expired. This avoids blocking barge-in
-                                    # between filler and real response, while keeping the echo
-                                    # protection mechanism intact for future TTS emissions.
                                     _post_guard = getattr(self.config, "barge_in", None)
                                     _post_ms = getattr(_post_guard, "post_tts_end_protection_ms", 250) if _post_guard else 250
                                     session.tts_ended_ts = time.time() - (_post_ms / 1000.0) - 0.01
-                                if _old_pn is not None:
-                                    self._assign_session_provider(session, _old_pn)
-                            except Exception:
-                                logger.debug("Pipeline filler audio failed", call_id=call_id, exc_info=True)
-                                try:
-                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except asyncio.CancelledError:
+                                    raise
                                 except Exception:
-                                    pass
+                                    logger.debug("Pipeline filler audio failed", call_id=call_id, exc_info=True)
+                                    try:
+                                        await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                    except Exception:
+                                        pass
+                                finally:
+                                    _filler_active = False
+
+                            _filler_task = asyncio.ensure_future(_run_filler())
 
                     # ── Streaming overlap: LLM tokens → sentence split → TTS ──
                     # Works even when tools are configured: if the LLM returns a tool
@@ -16957,11 +17026,20 @@ class Engine:
                         full_response_text = ""
                         first_tts_ts: Optional[float] = None
 
-                        stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
+                        # Speed: the playback stream is opened lazily, at the first
+                        # synthesized chunk. Opening it eagerly would collide with the
+                        # filler (one streaming slot per call) and force us to wait for
+                        # the phrase to finish before the real audio could be queued.
+                        stream_q: Optional[asyncio.Queue] = None
                         old_provider_name = getattr(session, "provider_name", None)
                         # Set when the TTS adapter consumes a text stream for the turn.
                         tts_stream_task = None
                         text_q = None
+                        # Set once the block ends normally. On abnormal exits the
+                        # filler must be cut immediately (barge-in/provider error),
+                        # on normal ones it is drained by the caller below so the
+                        # phrase can still cover tool-only turns.
+                        _stream_block_finished = False
                         try:
                             self._assign_session_provider(session, "pipeline")
                             await self.session_store.upsert_call(session)
@@ -16980,21 +17058,31 @@ class Engine:
                             except Exception:
                                 tts_rate = 8000
 
-                            stream_id = await self.streaming_playback_manager.start_streaming_playback(
-                                call_id,
-                                stream_q,
-                                playback_type="pipeline-tts",
-                                source_encoding=tts_encoding,
-                                source_sample_rate=tts_rate,
-                            )
-                            if not stream_id:
-                                raise RuntimeError("start_streaming_playback returned no stream_id")
+                            stream_id: Optional[str] = None
+
+                            async def _ensure_playback_stream() -> None:
+                                """Cut the filler and open the real TTS stream on first audio."""
+                                nonlocal stream_id, stream_q
+                                if stream_id is not None:
+                                    return
+                                await _end_filler(drain=False)
+                                stream_q = asyncio.Queue(maxsize=256)
+                                stream_id = await self.streaming_playback_manager.start_streaming_playback(
+                                    call_id,
+                                    stream_q,
+                                    playback_type="pipeline-tts",
+                                    source_encoding=tts_encoding,
+                                    source_sample_rate=tts_rate,
+                                )
+                                if not stream_id:
+                                    raise RuntimeError("start_streaming_playback returned no stream_id")
 
                             async def _deliver_tts_chunk(tts_chunk) -> None:
                                 """Hand one synthesized chunk to the playback stream."""
                                 nonlocal first_tts_ts
                                 if not tts_chunk:
                                     return
+                                await _ensure_playback_stream()
                                 if first_tts_ts is None:
                                     first_tts_ts = time.time()
                                     turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
@@ -17103,10 +17191,12 @@ class Engine:
                                 await tts_stream_task
                                 tts_stream_task = None
 
-                            # End-of-segment sentinel
-                            await self._put_pipeline_stream_chunk(
-                                call_id, stream_id, stream_q, None
-                            )
+                            # End-of-segment sentinel. No stream exists when the turn
+                            # produced no audio at all (tool-call-only response).
+                            if stream_id is not None:
+                                await self._put_pipeline_stream_chunk(
+                                    call_id, stream_id, stream_q, None
+                                )
                             try:
                                 if t_start is not None:
                                     _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
@@ -17121,6 +17211,8 @@ class Engine:
                                 _latm.finish_turn(call_id)
                             except Exception:
                                 pass
+
+                            _stream_block_finished = True
 
                         except _PipelinePlaybackInterrupted:
                             logger.info(
@@ -17151,6 +17243,12 @@ class Engine:
                                     tts_stream_task.cancel()
                                 with contextlib.suppress(BaseException):
                                     await tts_stream_task
+                            # Abnormal exit (barge-in, provider error): the filler
+                            # must release the slot right away. A normal exit leaves
+                            # it running so the phrase still covers no-audio turns.
+                            if not _stream_block_finished:
+                                with contextlib.suppress(Exception):
+                                    await _end_filler(drain=False)
                             try:
                                 self._assign_session_provider(session, old_provider_name)
                                 await self.session_store.upsert_call(session)
@@ -17218,6 +17316,14 @@ class Engine:
                                     "Pipeline streaming produced no text; falling to serial path",
                                     call_id=call_id,
                                 )
+
+                    # Release the filler slot before any serial/tool playback path
+                    # opens its own stream. Waiting here also lets the phrase finish
+                    # naturally on turns that produced no audio (tool-only turns).
+                    try:
+                        await _end_filler(drain=True)
+                    except Exception:
+                        logger.debug("Pipeline filler finalization failed", call_id=call_id, exc_info=True)
 
                     # ── Serial path (original) ──
                     # Skip if streaming path already set tool_calls
@@ -17591,17 +17697,20 @@ class Engine:
 
                     # 2. Execute Tools (if any)
                     if tool_calls:
-                        # Wait for playback to finish before executing tools (especially transfer/hangup)
-                        if playback_id:
+                        # Latency: only pause for tools that end or hand off the
+                        # call, and only when something was actually spoken. The
+                        # old unconditional len(text)*0.08s wait made a lookup
+                        # turn (speak + mca_save_facts) sleep through the whole
+                        # estimated playback — 5-15s of dead air — even though
+                        # spoken audio is already buffered on the media stream.
+                        _pause_for_playback = any(
+                            str(tc.get("name") or "").strip().lower()
+                            in _TERMINAL_TOOL_PAUSE_NAMES
+                            for tc in tool_calls
+                        )
+                        if _pause_for_playback and (playback_id or (_streaming_handled and response_text)):
                             try:
                                 # Best effort wait to let user hear the response
-                                await asyncio.sleep(len(response_text) * 0.08)
-                            except Exception:
-                                pass
-                        elif _streaming_handled and response_text:
-                            try:
-                                # Streaming path played audio without setting playback_id;
-                                # estimate wait from response length so caller hears farewell
                                 await asyncio.sleep(len(response_text) * 0.08)
                             except Exception:
                                 pass
@@ -17791,7 +17900,30 @@ class Engine:
                                             tool_call_id=function_call_id
                                         ))
                                         logger.info("Tool result added to LLM context, triggering continuation", tool=name, call_id=call_id)
-                                        
+
+                                        # Latency: if this turn already streamed a
+                                        # spoken reply and the pipeline opts in
+                                        # (llm option skip_continuation_when_spoken),
+                                        # do not pay a second LLM round just to say
+                                        # something like "я записал". The tool result
+                                        # is already persisted via
+                                        # record_in_call_tool_result above, and the
+                                        # spoken reply is already in the transcript.
+                                        _skip_continuation = bool(
+                                            response_text
+                                            and _streaming_handled
+                                            and (llm_options or {}).get(
+                                                "skip_continuation_when_spoken"
+                                            )
+                                        )
+                                        if _skip_continuation:
+                                            logger.info(
+                                                "Skipping tool continuation round (reply already spoken)",
+                                                tool=name,
+                                                call_id=call_id,
+                                            )
+                                            continue
+
                                         # Trigger LLM to generate follow-up response
                                         try:
                                             context_for_llm = {"prior_messages": _sanitize_for_llm(llm_context_history)}
@@ -22507,6 +22639,134 @@ class Engine:
             quiet_sec=quiet_sec,
             reason="deferred_transfer",
         )
+
+    # Cap for prefetched prompt payloads. Keeps the system prompt small (fast
+    # prefill) while still carrying a full CRM requirements document; larger
+    # payloads are truncated, never dropped silently.
+    _PIPELINE_PREFETCH_MAX_CHARS = 4000
+
+    async def _prefetch_pipeline_prompt_tools(
+        self,
+        call_id: str,
+        session: "CallSession",
+        llm_options: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Fetch declared in-call read-only tools before the first LLM turn.
+
+        Latency: MCA-style flows used to *mandate* a CRM lookup call at the
+        start of the conversation ("вызови mca_get_requirements в начале
+        звонка"). Every such turn then paid two sequential LLM round-trips
+        (~1.5-2.5s each on a cloud gateway) before any audio could be spoken.
+
+        Tool names listed in the pipeline llm option ``prefetch_tools`` are
+        executed here, once, with empty parameters — before the system prompt
+        is composed — and each successful payload is stored in
+        ``session.pre_call_results`` as ``<tool_name>_data``, so the normal
+        prompt template substitution exposes it as ``{<tool_name>_data}``.
+
+        Failures are non-fatal by design: the prompt keeps its explicit
+        "if the data block is empty — call the tool yourself" fallback, so a
+        down CRM or a bad URL only costs the extra round it always cost.
+        """
+        names_raw = (llm_options or {}).get("prefetch_tools") or []
+        if isinstance(names_raw, str):
+            names_raw = [names_raw]
+        names = [str(n).strip() for n in names_raw if isinstance(n, str) and n.strip()]
+        if not names:
+            return llm_options
+
+        tool_registry = self._tool_registry_for_session(session)
+        if not tool_registry:
+            return llm_options
+
+        from src.tools.context import ToolExecutionContext
+
+        tool_ctx = ToolExecutionContext(
+            call_id=call_id,
+            caller_channel_id=getattr(session, "caller_channel_id", None) or call_id,
+            bridge_id=getattr(session, "bridge_id", None),
+            caller_number=getattr(session, "caller_number", None),
+            called_number=getattr(session, "called_number", None),
+            caller_name=getattr(session, "caller_name", None),
+            context_name=getattr(session, "context_name", None),
+            session_store=self.session_store,
+            ari_client=self.ari_client,
+            config=self._tool_config_for_session(session),
+            tool_registry=tool_registry,
+            provider_name="pipeline",
+        )
+
+        fetched: Dict[str, str] = {}
+        for name in names:
+            try:
+                tool = tool_registry.get(name)
+            except Exception:
+                tool = None
+            if not tool:
+                logger.info(
+                    "Pipeline prompt prefetch tool not found",
+                    call_id=call_id,
+                    tool=name,
+                )
+                continue
+            timeout_sec = max(
+                0.2, float(getattr(tool.definition, "timeout_ms", 2000) or 2000) / 1000.0
+            )
+            started = time.time()
+            try:
+                result = await asyncio.wait_for(
+                    tool.execute({}, tool_ctx), timeout=timeout_sec
+                )
+            except Exception:
+                logger.info(
+                    "Pipeline prompt prefetch failed",
+                    call_id=call_id,
+                    tool=name,
+                    exc_info=True,
+                )
+                continue
+            status = (
+                str(result.get("status") or "").lower()
+                if isinstance(result, dict)
+                else ""
+            )
+            data = result.get("data") if isinstance(result, dict) else None
+            if status not in {"success", "ok"} or data in (None, "", {}, []):
+                logger.info(
+                    "Pipeline prompt prefetch returned no data",
+                    call_id=call_id,
+                    tool=name,
+                    status=status or None,
+                )
+                continue
+            text = (
+                data
+                if isinstance(data, str)
+                else json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            )
+            if len(text) > self._PIPELINE_PREFETCH_MAX_CHARS:
+                text = text[: self._PIPELINE_PREFETCH_MAX_CHARS] + "…"
+            fetched[f"{name}_data"] = text
+            logger.info(
+                "Pipeline prompt prefetch completed",
+                call_id=call_id,
+                tool=name,
+                duration_ms=round((time.time() - started) * 1000, 2),
+                chars=len(text),
+            )
+
+        if fetched:
+            try:
+                session.pre_call_results = {
+                    **(getattr(session, "pre_call_results", None) or {}),
+                    **fetched,
+                }
+                await self._save_session(session)
+            except Exception:
+                logger.debug(
+                    "Failed persisting prefetch results", call_id=call_id, exc_info=True
+                )
+        return llm_options
 
     async def _execute_pre_call_tools(
         self,

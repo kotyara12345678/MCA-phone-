@@ -116,13 +116,20 @@ llm:
     Ты — голосовой ассистент компании MCA (логистика, грузоперевозки по России
     и СНГ). Отвечай по-русски, коротко (одно-два предложения), живым голосом.
 
+    ДАННЫЕ ЗАЯВКИ ИЗ CRM (получены заранее; сам инструмент НЕ вызывай):
+    {mca_get_requirements_data}
+
     ОБЯЗАТЕЛЬНО:
-    - В начале звонка вызови mca_get_requirements (продолжение разговора, если
-      лид уже есть). Вопросы с answered=true не переспрашивай.
+    - Если блок «ДАННЫЕ ЗАЯВКИ» пуст или шаблон не подставился, вызови
+      mca_get_requirements ровно один раз. Вопросы с answered=true не
+      переспрашивай.
     - Собери проверенные факты: компания/ИНН, груз, города, вес/объём/кол-во,
       даты, транспорт, особенности, контакты, email.
-    - Каждый принятый факт сохраняй через mca_save_facts. Email — через
+    - Сохраняй принятые факты через mca_save_facts ОДНИМ вызовом вместе со
+      своей репликой клиенту (инструмент и текст в одном ответе). Email — через
       mca_save_contact сразу после подтверждения по буквам.
+    - Отвечай и задавай вопрос СРАЗУ, не дожидаясь вызовов инструментов:
+      сначала реплика, инструменты — тем же ходом.
     - Один вопрос за раз; когда данных достаточно — mca_qualify.
     - Нет уверенности / просят цену или менеджера — mca_transfer_to_manager.
 
@@ -149,11 +156,24 @@ pipelines:
         # Short spoken replies only — caps tail latency of the sentence that
         # triggers TTS and keeps tool-call turns from ballooning.
         max_tokens: 160
-        # Tighten STT→LLM handoff (defaults 2.0s / 3 words / 12 chars).
-        aggregation_timeout_sec: 0.6
+        # Tighten STT→LLM handoff (defaults 2.0s / 3 words / 12 chars). Only
+        # short acks ("да") wait for this window; normal utterances start the
+        # turn as soon as the STT final arrives.
+        aggregation_timeout_sec: 0.4
         aggregation_min_words: 2
         aggregation_min_chars: 6
         request_timeout_sec: 12
+        # Latency: CRM state is fetched once, before the first turn, and
+        # inlined into the system prompt as {mca_get_requirements_data}. This
+        # removes a mandatory second LLM round-trip per turn (previously:
+        # LLM → mca_get_requirements → tool → LLM again ≈ +1.5-2.5s of dead
+        # air). On failure the prompt falls back to the in-call tool.
+        prefetch_tools:
+          - mca_get_requirements
+        # Latency: when the turn already streamed a spoken reply, skip the
+        # follow-up LLM round that fact-save tools used to trigger (it added
+        # ~1.5-2s and a redundant "я записал" utterance after the answer).
+        skip_continuation_when_spoken: true
       tts:
         format:
           encoding: ulaw
