@@ -5,6 +5,7 @@ import wave
 from io import BytesIO
 from unittest.mock import MagicMock
 
+import aiohttp
 import pytest
 
 from src.audio.resampler import convert_pcm16le_to_target_format
@@ -254,7 +255,13 @@ async def test_openai_llm_stream_timeout_returns_empty_for_serial_fallback():
 
     assert chunks == []
     assert fake_session.requests[0]["json"]["stream"] is True
-    assert fake_session.requests[0]["timeout"] == 1.5
+    # Streaming is bounded by inactivity, not total duration: a progressing
+    # stream must never be cut mid-audio, a stalled one must fail fast.
+    timeout = fake_session.requests[0]["timeout"]
+    assert isinstance(timeout, aiohttp.ClientTimeout)
+    assert timeout.total is None
+    assert timeout.sock_read == 1.5
+    assert timeout.sock_connect <= 10.0
     assert adapter._pending_tool_calls_by_call["call-1"] == []
 
 
@@ -329,6 +336,123 @@ async def test_openai_tts_adapter_synthesizes_chunks():
     assert request["json"]["model"] == "gpt-4o-mini-tts"
     assert request["json"]["voice"] == "alloy"
     assert request["json"]["response_format"] == "wav"
+
+
+class _ChunkedSSEStream:
+    """Byte-chunk iterator with hostile boundaries, as aiohttp delivers them:
+    one chunk may carry several SSE events, and one event may be split
+    across chunks."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+def _sse_bytes(events):
+    body = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
+    return body.encode("utf-8") + b"data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_stream_reassembles_sse_across_chunk_boundaries():
+    """Tokens split across byte chunks (or packed several per chunk) must all
+    be delivered. The old per-chunk decoder dropped them, which emptied
+    responses and forced a second serial LLM round."""
+    events = [
+        {"choices": [{"delta": {"content": "Привет, "}}]},
+        {"choices": [{"delta": {"content": "я на связи."}}]},
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "tc-1",
+                                "type": "function",
+                                "function": {"name": "mca_save_facts", "arguments": "{\"facts\""},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": ": \"[]\"}"}}
+                        ]
+                    }
+                }
+            ]
+        },
+    ]
+    raw = _sse_bytes(events)
+    # Cut inside the second event's payload; the final chunk then carries
+    # several complete events at once plus [DONE].
+    cut = raw.find("я на связи".encode("utf-8"))
+    chunks = [raw[:cut], raw[cut : cut + 13], raw[cut + 13 :]]
+    fake_session = _FakeStreamingSession(_ChunkedSSEStream(chunks))
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        _build_app_config(),
+        OpenAIProviderConfig(**_build_app_config().providers["openai"]),
+        {"use_realtime": False},
+        session_factory=lambda: fake_session,
+    )
+
+    await adapter.start()
+    tokens = [
+        chunk
+        async for chunk in adapter.generate_stream(
+            "call-1", "hello", {"system_prompt": "Ты — голосовой ассистент."}, {}
+        )
+    ]
+
+    assert "".join(tokens) == "Привет, я на связи."
+    pending = adapter._pending_tool_calls_by_call["call-1"]
+    assert len(pending) == 1
+    assert pending[0]["name"] == "mca_save_facts"
+    assert pending[0]["parameters"] == {"facts": "[]"}
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_stream_handles_comments_and_missing_final_newline():
+    """SSE comments, `data:` without a space and a missing trailing newline
+    must not lose the last event."""
+    payload = (
+        b": keep-alive comment\n\n"
+        + 'data: {"choices": [{"delta": {"content": "один"}}]}\n\n'.encode("utf-8")
+        + 'data:{"choices": [{"delta": {"content": " два"}}]}\n\n'.encode("utf-8")
+        + 'data: {"choices": [{"delta": {"content": " три"}}]}'.encode("utf-8")
+    )
+    fake_session = _FakeStreamingSession(_ChunkedSSEStream([payload]))
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        _build_app_config(),
+        OpenAIProviderConfig(**_build_app_config().providers["openai"]),
+        {"use_realtime": False},
+        session_factory=lambda: fake_session,
+    )
+
+    await adapter.start()
+    tokens = [
+        chunk
+        async for chunk in adapter.generate_stream(
+            "call-1", "hello", {"system_prompt": "s"}, {}
+        )
+    ]
+
+    assert "".join(tokens) == "один два три"
 
 
 @pytest.mark.asyncio

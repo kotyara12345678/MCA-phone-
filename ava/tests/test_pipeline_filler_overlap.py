@@ -383,11 +383,13 @@ async def test_llm_stream_starts_while_filler_is_playing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_filler_drains_when_turn_produces_no_audio(monkeypatch):
-    """No response audio -> the phrase finishes naturally and frees the slot."""
+    """No response audio -> the phrase finishes naturally and frees the slot,
+    then the guaranteed-response fallback speaks an acknowledgement instead of
+    leaving the caller in dead air."""
     events = []
     engine = await _new_engine(monkeypatch, events, filler=True)
     stt = _ResultStreamingStubSTT()
-    llm = _StreamingTextLLM(events, tokens=[])  # no tokens -> no audio
+    llm = _StreamingTextLLM(events, tokens=[])  # no tokens -> no model audio
     resolution = _Resolution(stt, llm, _FillerAwareTTS(events))
     await _prepare_session(engine)
     await _run_turn(engine, stt, resolution)
@@ -400,8 +402,18 @@ async def test_filler_drains_when_turn_produces_no_audio(monkeypatch):
     filler_stops = [e for e in events if e[0] == "stop" and e[1] == "pipeline-tts-filler"]
     assert len(filler_stops) == 1, events
     assert filler_stops[0][2] is True, filler_stops
-    # No response stream was ever opened for an empty turn.
-    assert not any(e[0] == "start" and e[1] == "pipeline-tts" for e in events), events
+    # The slot is freed by the drained phrase BEFORE the fallback opens the
+    # response stream — the caller hears the phrase, then the acknowledgement.
+    assert await _wait_for(
+        events,
+        lambda ev: any(
+            e[0] == "response_synth" and "Извините" in e[1] for e in ev
+        ),
+    ), events
+    start_response = _event_index(
+        events, lambda e: e[0] == "start" and e[1] == "pipeline-tts"
+    )
+    assert start_response > events.index(filler_stops[0]), events
 
     await engine._cleanup_call(CALL_ID)
 

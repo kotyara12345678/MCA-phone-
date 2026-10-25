@@ -1,0 +1,409 @@
+{
+  "base_url": "https://polza.ai/api/v1",
+  "results": [
+    {
+      "model": "sber/gigachat-plus",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 833.3,
+      "ttft_p95_ms": 857.1,
+      "total_p50_ms": 837.4,
+      "total_p95_ms": 956.7,
+      "usage_sample": {
+        "prompt_tokens": 22,
+        "completion_tokens": 14,
+        "total_tokens": 36,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null,
+        "server_tool_use": null,
+        "cost_rub": 0.010224,
+        "cost": 0.010224,
+        "plugins": null
+      }
+    },
+    {
+      "model": "sber/gigachat-2-pro",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1307.2,
+      "ttft_p95_ms": 1981.5,
+      "total_p50_ms": 1459.3,
+      "total_p95_ms": 2007.4,
+      "usage_sample": {
+        "prompt_tokens": 22,
+        "completion_tokens": 14,
+        "total_tokens": 36,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null,
+        "server_tool_use": null,
+        "cost_rub": 0.02556,
+        "cost": 0.02556,
+        "plugins": null
+      }
+    },
+    {
+      "model": "yandex/yandexgpt-5-pro",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 945.8,
+      "ttft_p95_ms": 1106.5,
+      "total_p50_ms": 955.4,
+      "total_p95_ms": 1139.8,
+      "usage_sample": {
+        "prompt_tokens": 57,
+        "completion_tokens": 6,
+        "total_tokens": 63,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null,
+        "server_tool_use": null,
+        "cost_rub": 0.107352,
+        "cost": 0.107352,
+        "plugins": null
+      }
+    },
+    {
+      "model": "yandex/yandexgpt-5.1-pro",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 808.2,
+      "ttft_p95_ms": 861.4,
+      "total_p50_ms": 940.2,
+      "total_p95_ms": 978.7,
+      "usage_sample": {
+        "prompt_tokens": 56,
+        "completion_tokens": 15,
+        "total_tokens": 71,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null,
+        "server_tool_use": null,
+        "cost_rub": 0.080656,
+        "cost": 0.080656,
+        "plugins": null
+      }
+    },
+    {
+      "model": "amazon/nova-lite-v1",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1326.4,
+      "ttft_p95_ms": 2246.5,
+      "total_p50_ms": 1833.4,
+      "total_p95_ms": 2369.3,
+      "usage_sample": {
+        "prompt_tokens": 80,
+        "completion_tokens": 14,
+        "total_tokens": 94,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.00094482,
+        "cost": 0.00094482,
+        "plugins": null
+      }
+    },
+    {
+      "model": "bytedance-seed/seed-1.6-flash",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": NaN,
+      "ttft_p95_ms": NaN,
+      "total_p50_ms": 2264.3,
+      "total_p95_ms": 4179.6,
+      "usage_sample": {
+        "prompt_tokens": 151,
+        "completion_tokens": 64,
+        "total_tokens": 215,
+        "completion_tokens_details": {
+          "reasoning_tokens": 64,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.00353439,
+        "cost": 0.00353439,
+        "plugins": null
+      }
+    },
+    {
+      "model": "mistralai/mistral-small-3.2-24b-instruct",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1580.9,
+      "ttft_p95_ms": 2020.3,
+      "total_p50_ms": 1804.9,
+      "total_p95_ms": 2321.9,
+      "usage_sample": {
+        "prompt_tokens": 70,
+        "completion_tokens": 20,
+        "total_tokens": 90,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.00133878,
+        "cost": 0.00133878,
+        "plugins": null
+      }
+    },
+    {
+      "model": "stepfun/step-3.7-flash",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": NaN,
+      "ttft_p95_ms": NaN,
+      "total_p50_ms": 4749.0,
+      "total_p95_ms": 6040.2,
+      "usage_sample": {
+        "prompt_tokens": 85,
+        "completion_tokens": 64,
+        "total_tokens": 149,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.01049028,
+        "cost": 0.01049028,
+        "plugins": null
+      }
+    },
+    {
+      "model": "qwen/qwen3.8-flash",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": NaN,
+      "ttft_p95_ms": NaN,
+      "total_p50_ms": 5449.7,
+      "total_p95_ms": 8153.9,
+      "usage_sample": {
+        "prompt_tokens": 116,
+        "completion_tokens": 64,
+        "total_tokens": 180,
+        "completion_tokens_details": {
+          "reasoning_tokens": 64,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.00544258,
+        "cost": 0.00544258,
+        "plugins": null
+      }
+    },
+    {
+      "model": "qwen/qwen3.5-flash-02-23",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1668.5,
+      "ttft_p95_ms": 2245.5,
+      "total_p50_ms": 2554.9,
+      "total_p95_ms": 2709.8,
+      "usage_sample": {
+        "prompt_tokens": 78,
+        "completion_tokens": 64,
+        "total_tokens": 142,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.00248859,
+        "cost": 0.00248859,
+        "plugins": null
+      }
+    },
+    {
+      "model": "openai/gpt-5.4-nano",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1417.7,
+      "ttft_p95_ms": 1607.6,
+      "total_p50_ms": 1814.0,
+      "total_p95_ms": 2238.7,
+      "usage_sample": {
+        "prompt_tokens": 69,
+        "completion_tokens": 25,
+        "total_tokens": 94,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.00527313,
+        "cost": 0.00527313,
+        "plugins": null
+      }
+    },
+    {
+      "model": "google/gemini-2.5-flash",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1361.7,
+      "ttft_p95_ms": 2125.5,
+      "total_p50_ms": 1459.5,
+      "total_p95_ms": 2745.7,
+      "usage_sample": {
+        "prompt_tokens": 60,
+        "completion_tokens": 8,
+        "total_tokens": 68,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.00449285,
+        "cost": 0.00449285,
+        "plugins": null
+      }
+    },
+    {
+      "model": "minimax/minimax-m2.5",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 2822.5,
+      "ttft_p95_ms": 2822.5,
+      "total_p50_ms": 3972.2,
+      "total_p95_ms": 13496.4,
+      "usage_sample": {
+        "prompt_tokens": 84,
+        "completion_tokens": 58,
+        "total_tokens": 142,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.02173365,
+        "cost": 0.02173365,
+        "plugins": null
+      }
+    },
+    {
+      "model": "z-ai/glm-5.3-flashx",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": NaN,
+      "ttft_p95_ms": NaN,
+      "total_p50_ms": 3387.1,
+      "total_p95_ms": 5042.3,
+      "usage_sample": {
+        "prompt_tokens": 73,
+        "completion_tokens": 64,
+        "total_tokens": 137,
+        "completion_tokens_details": {
+          "reasoning_tokens": 64,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.01226644,
+        "cost": 0.01226644,
+        "plugins": null
+      }
+    }
+  ]
+}

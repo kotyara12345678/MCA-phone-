@@ -402,6 +402,28 @@ def _sanitize_for_llm(history: list) -> list:
     return sanitized
 
 
+def _trim_history_for_llm(messages: list, max_messages: Any) -> list:
+    """Keep only the tail of the conversation before it goes to the LLM.
+
+    Long calls otherwise resend the whole transcript on every turn, so prompt
+    prefill grows linearly and the gateway answers a "big request" many
+    seconds later. The cut always lands on a ``user`` message so an
+    assistant-tool_calls / ``tool`` pair is never split — strict
+    OpenAI-compatible providers reject a dangling ``tool`` message.
+    A falsy/invalid limit disables trimming (existing behaviour).
+    """
+    try:
+        limit = int(max_messages) if max_messages else 0
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or not messages or len(messages) <= limit:
+        return messages
+    cut = len(messages) - limit
+    while cut < len(messages) and messages[cut].get("role") != "user":
+        cut += 1
+    return messages[cut:]
+
+
 class Engine:
     """The main application engine."""
 
@@ -16825,6 +16847,59 @@ class Engine:
                 # AAVA-85 FIX: Initialize from session to preserve greeting
                 conversation_history: List[Dict[str, str]] = list(session.conversation_history or [])
 
+                # True once this turn's response audio reached the playback
+                # stream. Gates the last-resort spoken fallback so it can never
+                # talk over real assistant audio or a caller's barge-in.
+                turn_spoke_audio = False
+
+                async def _speak_turn_fallback(trigger: str) -> None:
+                    """A turn must never end in silence.
+
+                    If the LLM failed, timed out or returned nothing (the
+                    observed "agent does not respond after a big request"
+                    failure), speak a short acknowledgement so the caller is
+                    prompted to repeat instead of hearing dead air.
+                    """
+                    nonlocal turn_spoke_audio
+                    if turn_spoke_audio:
+                        return
+                    if not self._pipeline_output_allowed(
+                        call_id, session, stage="turn-fallback"
+                    ):
+                        return
+                    text = str((llm_options or {}).get("turn_fallback_message") or "").strip() or (
+                        "Извините, я вас не расслышала. Повторите, пожалуйста, ваш вопрос."
+                    )
+                    turn_spoke_audio = True
+                    try:
+                        if self._pipeline_tts_uses_streaming(pipeline):
+                            await asyncio.wait_for(
+                                self._stream_pipeline_tts_text(
+                                    call_id, session, pipeline, text
+                                ),
+                                timeout=8.0,
+                            )
+                        else:
+                            tts_bytes = bytearray()
+                            async for chunk in pipeline.tts_adapter.synthesize(
+                                call_id, text, pipeline.tts_options
+                            ):
+                                if chunk:
+                                    tts_bytes.extend(chunk)
+                            if tts_bytes:
+                                await self.playback_manager.play_audio(
+                                    call_id, bytes(tts_bytes), "pipeline-turn-fallback"
+                                )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug(
+                            "Pipeline turn fallback speech failed",
+                            call_id=call_id,
+                            trigger=trigger,
+                            exc_info=True,
+                        )
+
                 async def cancel_flush() -> None:
                     nonlocal flush_task
                     if flush_task and not flush_task.done():
@@ -16834,7 +16909,7 @@ class Engine:
                     flush_task = None
 
                 async def run_turn(transcript_text: str) -> None:
-                    nonlocal conversation_history
+                    nonlocal conversation_history, turn_spoke_audio
                     if not self._pipeline_output_allowed(
                         call_id, session, stage="turn-start"
                     ):
@@ -16858,9 +16933,14 @@ class Engine:
                     provider_label = getattr(session, 'provider_name', None) or 'unknown'
                     t_start = self._last_transcript_ts.get(call_id)
                     
-                    # Build context with conversation history
-                    # System prompt only in first turn (when history is empty)
-                    context_for_llm = {"prior_messages": _sanitize_for_llm(conversation_history)}
+                    # Build context with conversation history (tail-bounded: a
+                    # long call must not resend its full transcript every turn)
+                    _max_history = (llm_options or {}).get("max_history_messages", 16)
+                    context_for_llm = {
+                        "prior_messages": _trim_history_for_llm(
+                            _sanitize_for_llm(conversation_history), _max_history
+                        )
+                    }
 
                     # ── Pipeline filler audio: instant ack while the LLM thinks ──
                     # Speed: the filler used to be synthesized AND fully played back
@@ -17079,10 +17159,11 @@ class Engine:
 
                             async def _deliver_tts_chunk(tts_chunk) -> None:
                                 """Hand one synthesized chunk to the playback stream."""
-                                nonlocal first_tts_ts
+                                nonlocal first_tts_ts, turn_spoke_audio
                                 if not tts_chunk:
                                     return
                                 await _ensure_playback_stream()
+                                turn_spoke_audio = True
                                 if first_tts_ts is None:
                                     first_tts_ts = time.time()
                                     turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
@@ -17226,17 +17307,37 @@ class Engine:
                                 pass
                             return
                         except Exception:
-                            logger.error(
-                                "Pipeline streaming overlap failed; falling through to serial path",
-                                call_id=call_id,
-                                exc_info=True,
-                            )
-                            try:
-                                await self.streaming_playback_manager.stop_streaming_playback(call_id)
-                            except Exception:
-                                pass
-                            # Don't return — fall through to serial path below
-                            full_response_text = ""
+                            if full_response_text.strip():
+                                # Partial audio already reached the caller.
+                                # Replaying the full answer through the serial
+                                # path would speak it twice — keep what was
+                                # streamed and end the turn cleanly.
+                                logger.warning(
+                                    "Pipeline streaming failed mid-response; keeping partial reply",
+                                    call_id=call_id,
+                                    chars=len(full_response_text),
+                                    exc_info=True,
+                                )
+                                if stream_id is not None:
+                                    try:
+                                        await self._put_pipeline_stream_chunk(
+                                            call_id, stream_id, stream_q, None
+                                        )
+                                    except Exception:
+                                        pass
+                                _stream_block_finished = True
+                            else:
+                                logger.error(
+                                    "Pipeline streaming overlap failed; falling through to serial path",
+                                    call_id=call_id,
+                                    exc_info=True,
+                                )
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+                                # Don't return — fall through to serial path below
+                                full_response_text = ""
                         finally:
                             if tts_stream_task is not None:
                                 if not tts_stream_task.done():
@@ -17336,7 +17437,12 @@ class Engine:
                                 llm_options,  # Use context-injected options (includes system_prompt)
                             )
                         except Exception:
-                            logger.debug("LLM generate failed", call_id=call_id, exc_info=True)
+                            logger.error(
+                                "LLM generate failed; speaking turn fallback",
+                                call_id=call_id,
+                                exc_info=True,
+                            )
+                            await _speak_turn_fallback("llm_error")
                             return
 
                         if not self._pipeline_output_allowed(
@@ -17488,6 +17594,9 @@ class Engine:
                                 )
 
                     if not response_text and not tool_calls:
+                        # Nothing was spoken and the LLM produced no answer:
+                        # never leave the caller in dead air.
+                        await _speak_turn_fallback("empty_llm_response")
                         return
 
                     if not self._pipeline_output_allowed(
@@ -17560,6 +17669,7 @@ class Engine:
                                         first_tts_ts = time.time()
                                         turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                         session.turn_latencies_ms.append(turn_latency_ms)
+                                        turn_spoke_audio = True
                                         try:
                                             if t_start is not None:
                                                 _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -17605,6 +17715,7 @@ class Engine:
                                                 first_tts_ts = time.time()
                                                 turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                                 session.turn_latencies_ms.append(turn_latency_ms)
+                                                turn_spoke_audio = True
                                                 try:
                                                     if t_start is not None:
                                                         _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -17641,6 +17752,7 @@ class Engine:
                                             # Track turn latency for call history (Milestone 21)
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
+                                            turn_spoke_audio = True
                                             try:
                                                 if t_start is not None:
                                                     _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -17926,7 +18038,12 @@ class Engine:
 
                                         # Trigger LLM to generate follow-up response
                                         try:
-                                            context_for_llm = {"prior_messages": _sanitize_for_llm(llm_context_history)}
+                                            context_for_llm = {
+                                                "prior_messages": _trim_history_for_llm(
+                                                    _sanitize_for_llm(llm_context_history),
+                                                    (llm_options or {}).get("max_history_messages", 16),
+                                                )
+                                            }
                                             llm_response = await pipeline.llm_adapter.generate(
                                                 call_id,
                                                 "",  # Empty transcript - tool result already in context
@@ -17951,6 +18068,9 @@ class Engine:
                                                             return
 
                                                         if self._pipeline_tts_uses_streaming(pipeline):
+                                                            # Speech is about to be synthesized for this
+                                                            # continuation: suppress the turn fallback.
+                                                            turn_spoke_audio = True
                                                             try:
                                                                 await self._stream_pipeline_tts_text(
                                                                     call_id,
@@ -18216,6 +18336,7 @@ class Engine:
                                                                 )
                                         except Exception as e:
                                             logger.error("LLM continuation failed", error=str(e), exc_info=True)
+                                            await _speak_turn_fallback("continuation_error")
                                 else:
                                     logger.warning("Tool not found", tool=name)
                                     tool_result_recorded = True
@@ -18330,7 +18451,22 @@ class Engine:
                         flush_task = None
                     else:
                         await cancel_flush()
-                    await run_turn(aggregated)
+                    try:
+                        await run_turn(aggregated)
+                    except _PipelinePlaybackInterrupted:
+                        # Caller barged in: staying silent is the correct response.
+                        logger.info("Pipeline turn interrupted by barge-in", call_id=call_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # One broken turn must neither kill the dialog worker
+                        # nor leave the caller without an answer.
+                        logger.error(
+                            "Pipeline turn failed; speaking turn fallback",
+                            call_id=call_id,
+                            exc_info=True,
+                        )
+                        await _speak_turn_fallback("turn_exception")
                     pending_segments.clear()
 
                 async def schedule_flush() -> None:

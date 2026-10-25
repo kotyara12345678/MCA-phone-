@@ -732,54 +732,58 @@ class OpenAILLMAdapter(LLMComponent):
         _tool_call_accum: dict = {}  # index -> {id, name, arguments}
 
         try:
-            async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
+            # Streaming is bounded by *inactivity*, not total duration: a
+            # slow-but-progressing generation must never be cut off mid-audio,
+            # while a stalled gateway has to fail fast (sock_read) instead of
+            # hanging the turn for the full timeout.
+            stream_timeout = aiohttp.ClientTimeout(
+                total=None,
+                sock_connect=min(float(merged["timeout_sec"]), 10.0),
+                sock_read=float(merged["timeout_sec"]),
+            )
+            async with self._session.post(url, json=payload, headers=headers, timeout=stream_timeout) as response:
                 if response.status >= 400:
                     body = await response.text()
                     logger.error("OpenAI streaming failed", call_id=call_id, status=response.status, body_preview=body[:128])
                     return
 
-                async for line in response.content:
-                    line_str = line.decode("utf-8", errors="replace").strip()
-                    if not line_str or not line_str.startswith("data: "):
-                        continue
-                    data_str = line_str[6:]
-                    if data_str == "[DONE]":
-                        break
+                async for data_str in self._iter_sse_data(response.content):
                     try:
                         chunk = json.loads(data_str)
-                        choices = chunk.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            content = delta.get("content")
-                            if content:
-                                if not _first_token_seen:
-                                    _first_token_seen = True
-                                    try:
-                                        _metrics.mark(call_id, EV_LLM_FIRST_TOKEN)
-                                    except Exception:
-                                        pass
-                                yield content
-
-                            # Accumulate tool call deltas
-                            for tc_delta in delta.get("tool_calls", []):
-                                idx = tc_delta.get("index", 0)
-                                if idx not in _tool_call_accum:
-                                    _tool_call_accum[idx] = {
-                                        "id": tc_delta.get("id", ""),
-                                        "name": "",
-                                        "arguments": "",
-                                        "type": tc_delta.get("type", "function"),
-                                    }
-                                entry = _tool_call_accum[idx]
-                                if tc_delta.get("id"):
-                                    entry["id"] = tc_delta["id"]
-                                func = tc_delta.get("function", {})
-                                if func.get("name"):
-                                    entry["name"] = func["name"]
-                                if func.get("arguments"):
-                                    entry["arguments"] += func["arguments"]
                     except json.JSONDecodeError:
                         continue
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        if not _first_token_seen:
+                            _first_token_seen = True
+                            try:
+                                _metrics.mark(call_id, EV_LLM_FIRST_TOKEN)
+                            except Exception:
+                                pass
+                        yield content
+
+                    # Accumulate tool call deltas
+                    for tc_delta in delta.get("tool_calls", []):
+                        idx = tc_delta.get("index", 0)
+                        if idx not in _tool_call_accum:
+                            _tool_call_accum[idx] = {
+                                "id": tc_delta.get("id", ""),
+                                "name": "",
+                                "arguments": "",
+                                "type": tc_delta.get("type", "function"),
+                            }
+                        entry = _tool_call_accum[idx]
+                        if tc_delta.get("id"):
+                            entry["id"] = tc_delta["id"]
+                        func = tc_delta.get("function", {})
+                        if func.get("name"):
+                            entry["name"] = func["name"]
+                        if func.get("arguments"):
+                            entry["arguments"] += func["arguments"]
 
             # Parse accumulated tool calls
             if _tool_call_accum:
@@ -819,6 +823,37 @@ class OpenAILLMAdapter(LLMComponent):
             except Exception:
                 pass
             logger.error("OpenAI streaming connection error", call_id=call_id, error=str(e))
+
+    @staticmethod
+    async def _iter_sse_data(content) -> AsyncIterator[str]:
+        """Yield ``data:`` payloads from an SSE byte stream.
+
+        ``response.content`` yields arbitrary byte chunks, not lines: one event
+        may be split across two chunks and one chunk may carry several events.
+        Decoding chunk-by-chunk dropped every token in those cases, which
+        silently emptied responses and forced the engine into a second serial
+        LLM round (the source of multi-second double latency). Lines are
+        reassembled here so tokens are processed as they arrive.
+        """
+        pending = b""
+        async for raw in content:
+            pending += raw
+            while b"\n" in pending:
+                raw_line, pending = pending.split(b"\n", 1)
+                line = raw_line.strip()
+                if not line.startswith(b"data:"):
+                    # blank separator, SSE comment (": ...") or other fields
+                    continue
+                data = line[5:].strip().decode("utf-8", "ignore")
+                if data == "[DONE]":
+                    return
+                yield data
+        # Flush a trailing event that was never newline-terminated.
+        tail = pending.strip()
+        if tail.startswith(b"data:"):
+            data = tail[5:].strip().decode("utf-8", "ignore")
+            if data != "[DONE]":
+                yield data
 
     async def _ensure_session(self) -> None:
         if self._session and not self._session.closed:
