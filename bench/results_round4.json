@@ -1,0 +1,320 @@
+{
+  "date": "2026-10-26",
+  "note": "round 4 speak-first measurements, live Polza gateway",
+  "spoken_round_no_tools": {
+    "openai/gpt-4.1-mini": {
+      "model": "openai/gpt-4.1-mini",
+      "runs": 6,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1326.9,
+      "ttft_p95_ms": 10409.5,
+      "first_sentence_p50_ms": 1704.8,
+      "total_p50_ms": 1727.2,
+      "total_p95_ms": 12844.7,
+      "tool_only_total_p50_ms": NaN,
+      "tool_call_runs": 0,
+      "tool_only_runs": 0,
+      "tool_only_round1_runs": 0,
+      "rounds_p50": 1.0,
+      "llm_phase_p50_ms": 1727.2,
+      "llm_phase_p95_ms": 12844.7,
+      "mixed_runs": 0,
+      "text_only_runs": 6,
+      "tool_names": [],
+      "usage": {
+        "prompt_tokens": 764,
+        "completion_tokens": 16,
+        "total_tokens": 780,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.03876718,
+        "cost": 0.03876718,
+        "plugins": null
+      },
+      "text_sample": "Вы сказали, забор завтра утром с 9, раньше нельзя?"
+    },
+    "qwen/qwen3.5-flash-02-23": {
+      "model": "qwen/qwen3.5-flash-02-23",
+      "runs": 6,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1533.4,
+      "ttft_p95_ms": 2826.4,
+      "first_sentence_p50_ms": 1615.0,
+      "total_p50_ms": 2984.1,
+      "total_p95_ms": 4290.7,
+      "tool_only_total_p50_ms": NaN,
+      "tool_call_runs": 0,
+      "tool_only_runs": 0,
+      "tool_only_round1_runs": 0,
+      "rounds_p50": 1.0,
+      "llm_phase_p50_ms": 2984.1,
+      "llm_phase_p95_ms": 4290.7,
+      "mixed_runs": 0,
+      "text_only_runs": 6,
+      "tool_names": [],
+      "usage": {
+        "prompt_tokens": 784,
+        "completion_tokens": 160,
+        "total_tokens": 944,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.01061005,
+        "cost": 0.01061005,
+        "plugins": null
+      },
+      "text_sample": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   **Role:** Voice assistant for MCA (logistics, Russia/CIS).\n    *   **Language:** Russian.\n    *   **Styl"
+    },
+    "mistralai/mistral-small-3.2-24b-instruct": {
+      "model": "mistralai/mistral-small-3.2-24b-instruct",
+      "runs": 6,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1461.1,
+      "ttft_p95_ms": 4589.2,
+      "first_sentence_p50_ms": 2124.0,
+      "total_p50_ms": 2842.3,
+      "total_p95_ms": 6594.1,
+      "tool_only_total_p50_ms": NaN,
+      "tool_call_runs": 0,
+      "tool_only_runs": 0,
+      "tool_only_round1_runs": 0,
+      "rounds_p50": 1.0,
+      "llm_phase_p50_ms": 2842.3,
+      "llm_phase_p95_ms": 6594.1,
+      "mixed_runs": 0,
+      "text_only_runs": 6,
+      "tool_names": [],
+      "usage": {
+        "prompt_tokens": 817,
+        "completion_tokens": 21,
+        "total_tokens": 838,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.00938166,
+        "cost": 0.00938166,
+        "plugins": null
+      },
+      "text_sample": "Забор груза нужен завтра с девяти. Раньше не получится?"
+    },
+    "openai/gpt-4o-mini": {
+      "model": "openai/gpt-4o-mini",
+      "runs": 6,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1330.8,
+      "ttft_p95_ms": 2197.7,
+      "first_sentence_p50_ms": 1508.3,
+      "total_p50_ms": 1904.5,
+      "total_p95_ms": 2649.3,
+      "tool_only_total_p50_ms": NaN,
+      "tool_call_runs": 0,
+      "tool_only_runs": 0,
+      "tool_only_round1_runs": 0,
+      "rounds_p50": 1.0,
+      "llm_phase_p50_ms": 1904.5,
+      "llm_phase_p95_ms": 2649.3,
+      "mixed_runs": 0,
+      "text_only_runs": 6,
+      "tool_names": [],
+      "usage": {
+        "prompt_tokens": 764,
+        "completion_tokens": 38,
+        "total_tokens": 802,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.01608276,
+        "cost": 0.01608276,
+        "plugins": null
+      },
+      "text_sample": "Ранее девяти, к сожалению, не получится. Записываю все данные и передам их менеджеру для дальнейшей обработки. Пожалуйста, продиктуйте ваш email."
+    },
+    "google/gemini-2.5-flash": {
+      "model": "google/gemini-2.5-flash",
+      "runs": 6,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1056.8,
+      "ttft_p95_ms": 1425.5,
+      "first_sentence_p50_ms": 1590.4,
+      "total_p50_ms": 1633.1,
+      "total_p95_ms": 2036.0,
+      "tool_only_total_p50_ms": NaN,
+      "tool_call_runs": 0,
+      "tool_only_runs": 0,
+      "tool_only_round1_runs": 0,
+      "rounds_p50": 1.0,
+      "llm_phase_p50_ms": 1633.1,
+      "llm_phase_p95_ms": 2036.0,
+      "mixed_runs": 0,
+      "text_only_runs": 6,
+      "tool_names": [],
+      "usage": {
+        "prompt_tokens": 732,
+        "completion_tokens": 92,
+        "total_tokens": 824,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.05262598,
+        "cost": 0.05262598,
+        "plugins": null
+      },
+      "text_sample": "mca_save_facts({\"desired_deadline\": \"завтра утром\", \"transport_mode\": \"тентованная\", \"loading_features\": \"погрузка со стороны дока\", \"unloading_features\": \"разг"
+    }
+  },
+  "full_tool_loop": {
+    "google/gemini-2.5-flash": {
+      "model": "google/gemini-2.5-flash",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 5136.7,
+      "ttft_p95_ms": 7861.4,
+      "first_sentence_p50_ms": 5212.9,
+      "total_p50_ms": 5378.9,
+      "total_p95_ms": 8202.4,
+      "tool_only_total_p50_ms": NaN,
+      "tool_call_runs": 3,
+      "tool_only_runs": 0,
+      "tool_only_round1_runs": 3,
+      "rounds_p50": 2.0,
+      "llm_phase_p50_ms": 4633.8,
+      "llm_phase_p95_ms": 7888.7,
+      "mixed_runs": 3,
+      "text_only_runs": 0,
+      "tool_names": [
+        "mca_save_facts",
+        "mca_save_facts",
+        "mca_save_facts"
+      ],
+      "usage": {
+        "prompt_tokens": 1768,
+        "completion_tokens": 30,
+        "total_tokens": 1798,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 1609,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.0202143,
+        "cost": 0.0202143,
+        "plugins": null
+      },
+      "text_sample": "Я уже записал, что забор груза нужен завтра утром, с девяти. Вас интересует возможность более раннего забора?"
+    },
+    "openai/gpt-4.1-mini": {
+      "model": "openai/gpt-4.1-mini",
+      "runs": 5,
+      "errors": 0,
+      "error_samples": [],
+      "ttft_p50_ms": 1373.0,
+      "ttft_p95_ms": 1696.5,
+      "first_sentence_p50_ms": 1662.1,
+      "total_p50_ms": 1740.9,
+      "total_p95_ms": 2491.6,
+      "tool_only_total_p50_ms": NaN,
+      "tool_call_runs": 0,
+      "tool_only_runs": 0,
+      "tool_only_round1_runs": 0,
+      "rounds_p50": 1.0,
+      "llm_phase_p50_ms": 1740.9,
+      "llm_phase_p95_ms": 2491.6,
+      "mixed_runs": 0,
+      "text_only_runs": 5,
+      "tool_names": [],
+      "usage": {
+        "prompt_tokens": 1484,
+        "completion_tokens": 19,
+        "total_tokens": 1503,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "image_tokens": 0,
+          "accepted_prediction_tokens": null,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 1408,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "server_tool_use": null,
+        "cost_rub": 0.02359742,
+        "cost": 0.02359742,
+        "plugins": null
+      },
+      "text_sample": "Вы сказали, что забор нужен завтра утром с девяти, раньше нельзя?"
+    }
+  }
+}

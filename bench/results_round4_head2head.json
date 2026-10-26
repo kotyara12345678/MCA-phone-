@@ -1,0 +1,46 @@
+{
+  "date": "2026-10-26",
+  "note": "round-robin, 10 runs/model, prod prompt, no tools",
+  "results": {
+    "openai/gpt-4.1-mini": {
+      "n": 10,
+      "errors": 0,
+      "ttft_p50": 1502.2,
+      "ttft_p95": 5802.0,
+      "first_sentence_p50": 1887.5,
+      "first_sentence_p95": 7781.4,
+      "total_p50": 1888.8,
+      "total_p95": 7782.3
+    },
+    "google/gemini-2.5-flash": {
+      "n": 10,
+      "errors": 0,
+      "ttft_p50": 1138.0,
+      "ttft_p95": 1261.1,
+      "first_sentence_p50": 1835.2,
+      "first_sentence_p95": 2359.1,
+      "total_p50": 1881.2,
+      "total_p95": 2359.8
+    },
+    "openai/gpt-4o-mini": {
+      "n": 10,
+      "errors": 0,
+      "ttft_p50": 1476.6,
+      "ttft_p95": 2803.0,
+      "first_sentence_p50": 1651.8,
+      "first_sentence_p95": 2821.9,
+      "total_p50": 2031.8,
+      "total_p95": 3203.1
+    },
+    "mistralai/mistral-small-3.2-24b-instruct": {
+      "n": 10,
+      "errors": 0,
+      "ttft_p50": 1327.7,
+      "ttft_p95": 5627.0,
+      "first_sentence_p50": 1868.3,
+      "first_sentence_p95": 6092.6,
+      "total_p50": 2759.6,
+      "total_p95": 7279.0
+    }
+  }
+}

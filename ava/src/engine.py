@@ -16167,6 +16167,74 @@ class Engine:
             )
         return allowed
 
+    async def _pipeline_speak_first_tool_round(
+        self,
+        call_id: str,
+        transcript_text: str,
+        context_for_llm: Any,
+        llm_options: Dict[str, Any],
+        pipeline: Any,
+    ) -> List[Dict[str, Any]]:
+        """Tool-enabled LLM round issued IN PARALLEL with the spoken reply.
+
+        Measured on the live Polza gateway (bench/bench_prod_shape.py,
+        2026-10-26): with the five mca_* tool schemas attached, the conversational
+        model answers with a bare ``mca_save_facts`` tool call and NO text in
+        6/6 runs. Every turn therefore paid two LLM round-trips (p50 4.3s for the
+        whole tool loop) before the first spoken word.
+
+        Speak-first keeps the tool schemas off the critical streaming round so
+        round 1 always produces text, and runs this non-streaming round next to
+        it instead. Only its tool calls are consumed — the reply text is already
+        spoken by then, so nothing is repeated.
+        """
+        try:
+            result = await pipeline.llm_adapter.generate(
+                call_id, transcript_text, context_for_llm, llm_options
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Speak-first tool round failed; spoken reply kept",
+                call_id=call_id,
+                exc_info=True,
+            )
+            return []
+        tool_calls: List[Dict[str, Any]] = []
+        if isinstance(result, LLMResponse):
+            tool_calls = list(result.tool_calls or [])
+        pending_store = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", None)
+        if not tool_calls and isinstance(pending_store, dict):
+            tool_calls = list(pending_store.get(call_id) or [])
+        if isinstance(pending_store, dict):
+            # The parallel round must not leave state the serial path could re-read.
+            pending_store.pop(call_id, None)
+        if tool_calls:
+            logger.info(
+                "Speak-first tool round produced tool calls",
+                call_id=call_id,
+                tools=[tc.get("name") for tc in tool_calls],
+            )
+        return tool_calls
+
+    async def _await_speak_first_tool_round(
+        self, task: "asyncio.Task", call_id: str
+    ) -> List[Dict[str, Any]]:
+        """Collect the parallel tool round, bounded so a stalled gateway cannot
+        hold the turn open forever (the reply is already spoken)."""
+        try:
+            return list(await asyncio.wait_for(task, timeout=30.0) or [])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Speak-first tool round did not complete in time",
+                call_id=call_id,
+                exc_info=True,
+            )
+            return []
+
     async def _pipeline_runner(self, call_id: str) -> None:
         """Minimal adapter-driven loop: STT -> LLM -> TTS -> file playback.
 
@@ -17120,6 +17188,33 @@ class Engine:
                         # on normal ones it is drained by the caller below so the
                         # phrase can still cover tool-only turns.
                         _stream_block_finished = False
+                        # Speak-first (llm option speak_first): the critical stream
+                        # goes out WITHOUT tool schemas so the model always answers
+                        # with text, while the tool round runs in parallel and is
+                        # executed after the reply. Off when no tools are configured.
+                        _speak_first_enabled = bool(
+                            (llm_options or {}).get("speak_first")
+                            and (llm_options or {}).get("tools")
+                        )
+                        _tool_round_task: Optional["asyncio.Task"] = None
+                        if _speak_first_enabled:
+                            try:
+                                _tool_round_task = asyncio.ensure_future(
+                                    self._pipeline_speak_first_tool_round(
+                                        call_id,
+                                        transcript_text,
+                                        context_for_llm,
+                                        llm_options,
+                                        pipeline,
+                                    )
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Speak-first tool round could not be scheduled",
+                                    call_id=call_id,
+                                    exc_info=True,
+                                )
+                                _tool_round_task = None
                         try:
                             self._assign_session_provider(session, "pipeline")
                             await self.session_store.upsert_call(session)
@@ -17231,8 +17326,26 @@ class Engine:
                                 ):
                                     await _deliver_tts_chunk(tts_chunk)
 
+                            _stream_llm_options = llm_options
+                            if _tool_round_task is not None:
+                                _stream_llm_options = {
+                                    key: value
+                                    for key, value in (llm_options or {}).items()
+                                    if key != "tools"
+                                }
+                                # Latency: the spoken round may use a different
+                                # (faster, non-reasoning) model than the tool round.
+                                # Measured on Polza with the production prompt and no
+                                # tools: gpt-4.1-mini first sentence p50 1.67s / p95
+                                # 1.79s vs gemini-2.5-flash 3.38s / 6.5s, while
+                                # gemini keeps owning the background tool round.
+                                _speak_first_model = str(
+                                    (llm_options or {}).get("speak_first_model") or ""
+                                ).strip()
+                                if _speak_first_model:
+                                    _stream_llm_options["chat_model"] = _speak_first_model
                             async for token in pipeline.llm_adapter.generate_stream(
-                                call_id, transcript_text, context_for_llm, llm_options,
+                                call_id, transcript_text, context_for_llm, _stream_llm_options,
                             ):
                                 sentence_buffer += token
                                 full_response_text += token
@@ -17339,6 +17452,14 @@ class Engine:
                                 # Don't return — fall through to serial path below
                                 full_response_text = ""
                         finally:
+                            # Only an ABNORMAL exit drops the parallel round here;
+                            # the normal path consumes its tool calls after this
+                            # block (see the pending-tools check below), so the
+                            # task must survive the finally on a clean finish.
+                            if not _stream_block_finished and _tool_round_task is not None:
+                                if not _tool_round_task.done():
+                                    _tool_round_task.cancel()
+                                _tool_round_task = None
                             if tts_stream_task is not None:
                                 if not tts_stream_task.done():
                                     tts_stream_task.cancel()
@@ -17364,8 +17485,17 @@ class Engine:
                             session.conversation_history = list(conversation_history)
                             await self.session_store.upsert_call(session)
 
-                            # Check for tool calls detected during streaming
-                            _pending_tools = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", {}).get(call_id) or []
+                            # Tool calls come from the parallel speak-first round
+                            # first; the stream itself carries none while speak-first
+                            # is on (its schemas were stripped).
+                            _pending_tools: List[Dict[str, Any]] = []
+                            if _tool_round_task is not None:
+                                _pending_tools = await self._await_speak_first_tool_round(
+                                    _tool_round_task, call_id
+                                )
+                                _tool_round_task = None
+                            if not _pending_tools:
+                                _pending_tools = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", {}).get(call_id) or []
                             if _pending_tools:
                                 logger.info(
                                     "Streaming path executing pending tool calls",
@@ -17401,6 +17531,13 @@ class Engine:
                             # Fall through to tool execution below if tool calls were found
                         else:
                             # Streaming produced no text — likely a tool-call-only response.
+                            # The speak-first stream yielded nothing usable: cancel the
+                            # parallel round so the serial path below owns the tools
+                            # instead of executing them twice.
+                            if _tool_round_task is not None:
+                                if not _tool_round_task.done():
+                                    _tool_round_task.cancel()
+                                _tool_round_task = None
                             _pending_tools = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", {}).get(call_id) or []
                             if _pending_tools:
                                 tool_calls = list(_pending_tools)
